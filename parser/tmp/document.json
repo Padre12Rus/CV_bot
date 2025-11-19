@@ -1,0 +1,167 @@
+{
+  "full_name": "Полякова Марина Владимировна",
+  "vacancy": "Разработчик Python (Backend)",
+  "pitch": "Я опытный Python разработчик с более чем 10-летним стажем, специализирующийся на разработке, построении архитектуры, оптимизации и анализе данных. Мой опыт включает работу с Flask, Django, FastAPI для микросервисов, проектирование RESTful API и интеграцию сторонних сервисов. Я имею опыт работы с высоконагруженными системами, адаптации баз данных для Big Data, а также построения асинхронных архитектур с использованием Celery и RabbitMQ. В моей практике есть 1 год руководства проектом, где я отвечала за сроки и задачи, а также глубокие знания в облачных технологиях (AWS, GCP, Azure), Docker и PyTorch для ML-задач. Я стремлюсь к повышению качества кода, использую тестирование и динамическое логирование.",
+  "general_info": {
+    "skills_and_tools": [
+      "Python",
+      "PostgreSQL",
+      "Flask",
+      "REST API",
+      "Django Rest Framework",
+      "FastAPI",
+      "Celery",
+      "Amazon Web Services",
+      "Redis",
+      "Azure",
+      "Docker",
+      "PyTorch",
+      "RabbitMQ",
+      "Google Cloud Platform",
+      "kubernates",
+      "N8N",
+      "ChatGPT",
+      "DeepSeek",
+      "Claude",
+      "Algolia search",
+      "scrapers",
+      "Google Cloud Engine",
+      "Facebook",
+      "Linkedin",
+      "Google Calendar",
+      "HackerRank"
+    ],
+    "education": [
+      "2012 Белгородский государственный технологический университет имени В.Г. Шухова, Белгород, ИИТУС, Программное обеспечение вычислительной техники и автоматизированных систем"
+    ],
+    "foreign_language": "Английский — B2 — Средне-продвинутый",
+    "citizenship_location": "Россия, Белгород",
+    "employment": "полная занятость",
+    "status": "Не готова к переезду, готова к редким командировкам"
+  },
+  "screening": {
+    "hard_skills": [
+      "Python",
+      "Flask",
+      "Django Rest Framework",
+      "FastAPI",
+      "PostgreSQL",
+      "Redis",
+      "Celery",
+      "RabbitMQ",
+      "Docker",
+      "kubernates",
+      "AWS",
+      "Google Cloud Platform",
+      "Azure",
+      "PyTorch",
+      "N8N",
+      "ChatGPT",
+      "DeepSeek",
+      "Claude",
+      "Algolia search",
+      "RESTful API Design",
+      "SQL",
+      "Web Scraping"
+    ],
+    "soft_skills": [
+      "Руководство проектами",
+      "Ответственность",
+      "Инициативность",
+      "Адаптивность",
+      "Внимание к качеству"
+    ]
+  },
+  "work_experience": [
+    {
+      "company": "AiraBotics(PET Project)",
+      "position": "Python-разработчик",
+      "period": "Январь 2025 — настоящее время",
+      "responsibilities": [
+        "Разработка ИИ ботов продавец-консультантов на базе N8N с памятью(RAG), обработка информации с помощью ChatGPT, DeepSeek, Claude"
+      ],
+      "technologies": [
+        "N8N",
+        "ChatGPT",
+        "DeepSeek",
+        "Claude"
+      ],
+      "projects": []
+    },
+    {
+      "company": "Prometheus Research",
+      "position": "Python-разработчик",
+      "period": "Январь 2019 — настоящее время",
+      "responsibilities": [
+        "API дизайн и реализация для клиентов, интеграция сторонних API сервисов, валидация и обработка данных.",
+        "Инициировала и реализовала перевод внутренних микросервисов компании во flask приложения.",
+        "Адаптировала вычисления и запросы к базе данных для big data.",
+        "Реализовала кеширование Redis для часто запрашиваемых данных.",
+        "Есть опыт руководства проектом: 1 год отвечала за соблюдение сроков и выполнение задач.",
+        "Подготовка и анализ данных для ML-задач."
+      ],
+      "technologies": [
+        "Flask",
+        "Redis"
+      ],
+      "projects": []
+    },
+    {
+      "company": "Stylindex",
+      "position": "Python-разработчик",
+      "period": "Январь 2018 — Октябрь 2018",
+      "responsibilities": [
+        "Дизайн, разработка и управление архитектурой системы аудита, которая формируется из данных 40+ scrapers.",
+        "Улучшила поиск с интеграцией Algolia search и рефакторингом.",
+        "Добавила динамическое логирование и улучшила покрытие тестами."
+      ],
+      "technologies": [
+        "Algolia search"
+      ],
+      "projects": []
+    },
+    {
+      "company": "Odelife(Pet Project)",
+      "position": "Python-разработчик",
+      "period": "Февраль 2017 — Октябрь 2018",
+      "responsibilities": [
+        "Создала собственный проект - платформу, посвященную парфюмерии, с фото, описаниями и отзывами.",
+        "Совмещала несколько ролей: backend, frontend и devops.",
+        "Добавила SEO оптимизацию, написала scraper для импорта данных, автоматизировала релизы с Google Cloud Engine."
+      ],
+      "technologies": [
+        "Google Cloud Engine"
+      ],
+      "projects": []
+    },
+    {
+      "company": "PowertoFly",
+      "position": "Python-разработчик",
+      "period": "Май 2014 — Январь 2017",
+      "responsibilities": [
+        "Разработка архитектуры базы данных и дизайн RESTful API на платформе с микросервисной архитектурой.",
+        "Разработка интеграций с Facebook, Linkedin, Google Calendar, и HackerRank.",
+        "Работала над оптимизацией производительности и улучшала стандарты для масштабирования"
+      ],
+      "technologies": [
+        "Facebook",
+        "Linkedin",
+        "Google Calendar",
+        "HackerRank"
+      ],
+      "projects": []
+    }
+  ],
+  "project_experience": [
+    {
+      "company": "Место работы / время",
+      "role": "Роль",
+      "tasks": [
+        "Задачи"
+      ],
+      "technologies_and_tools": [
+        "Технологии и инструменты"
+      ]
+    }
+  ]
+}

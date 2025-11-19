@@ -1,0 +1,47 @@
+{
+    "full_name": "ФИО",
+    "vacancy": "Место для указания вакансии",
+    "pitch": "Рассказ о себе от первого лица",
+    "general_info": {
+      "skills_and_tools": [],
+      "education": [],
+      "foreign_language": "",
+      "citizenship_location": "",
+      "employment": "",
+      "status": ""
+    },
+    "screening": {
+      "hard_skills": [],
+      "soft_skills": []
+    },
+    "work_experience": [
+      {
+        "company": "",
+        "position": "",
+        "period": "",
+        "responsibilities": [],
+        "technologies": [],
+        "projects": [
+          {
+            "project_name": "",
+            "role": "",
+            "tasks": [],
+            "tools": []
+          }
+        ]
+      }
+    ],
+    "project_experience": [
+      {
+        "company": "Место работы / время",
+        "role": "Роль",
+        "tasks": [
+          "Задачи"
+        ],
+        "technologies_and_tools": [
+          "Технологии и инструменты"
+        ]
+      }
+    ]
+  }
+  
