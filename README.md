@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 Или установите напрямую:
 ```bash
-pip install pdfplumber python-docx google-genai python-telegram-bot
+pip install pdfplumber python-docx google-genai aiogram python-dotenv requests
 ```
 
 ### Получение API ключа Gemini
@@ -278,12 +278,6 @@ python json_to_docx.py document.json --template template.docx --output result.do
 - Сохраняет форматирование исходного документа
 - Создает шаблон, готовый для использования с json_to_docx.py
 
-**Базовое использование:**
-```bash
-python docx_to_template.py document.docx
-```
-Создает файл `document_template.docx` с плейсхолдерами.
-
 **С указанием выходного файла:**
 ```bash
 python docx_to_template.py document.docx --output template.docx
@@ -304,4 +298,3 @@ python docx_to_template.py document.docx --output template.docx
 - Поддерживает пропуск отдельных шагов для оптимизации повторных запусков
 - Автоматически управляет промежуточными файлами (удаляет или сохраняет)
 - Обрабатывает ошибки на каждом этапе с понятными сообщениями
-

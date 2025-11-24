@@ -1,6 +1,7 @@
 {
     "full_name": "ФИО",
     "vacancy": "Место для указания вакансии",
+    "project_background": "Разработка ПО, отрасль",
     "pitch": "Рассказ о себе от первого лица",
     "general_info": {
       "skills_and_tools": [],
@@ -21,12 +22,14 @@
         "period": "",
         "responsibilities": [],
         "technologies": [],
+        "achievements": [],
         "projects": [
           {
             "project_name": "",
             "role": "",
             "tasks": [],
-            "tools": []
+            "tools": [],
+            "achievements": []
           }
         ]
       }
@@ -37,6 +40,9 @@
         "role": "Роль",
         "tasks": [
           "Задачи"
+        ],
+        "achievements": [
+          "Достижения"
         ],
         "technologies_and_tools": [
           "Технологии и инструменты"

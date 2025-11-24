@@ -10,16 +10,241 @@ import os
 import json
 import argparse
 import re
+from datetime import date
 from pathlib import Path
 
 try:
     from docx import Document
-    from docx.shared import Pt, RGBColor
+    from docx.shared import Pt, RGBColor, Cm
     from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 except ImportError:
     print("Ошибка: библиотека python-docx не установлена.")
     print("Установите её командой: pip install python-docx")
     sys.exit(1)
+
+from docx.oxml.ns import qn
+
+
+# Карты месяцев и специальных слов для вычисления стажа и форматирования периодов
+MONTHS_MAP = {
+    'январь': 1, 'января': 1,
+    'февраль': 2, 'февраля': 2,
+    'март': 3, 'марта': 3,
+    'апрель': 4, 'апреля': 4,
+    'май': 5, 'мая': 5,
+    'июнь': 6, 'июня': 6,
+    'июль': 7, 'июля': 7,
+    'август': 8, 'августа': 8,
+    'сентябрь': 9, 'сентября': 9,
+    'октябрь': 10, 'октября': 10,
+    'ноябрь': 11, 'ноября': 11,
+    'декабрь': 12, 'декабря': 12,
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12
+}
+
+CURRENT_PERIOD_TERMS = ['настоящее время', 'по настоящее время', 'по наст. время', 'н.в.', 'present', 'current']
+
+DURATION_WORD_REPLACEMENTS = {
+    'год': 'ГОД',
+    'года': 'ГОДА',
+    'году': 'ГОДУ',
+    'годом': 'ГОДОМ',
+    'лет': 'ЛЕТ',
+    'г.': 'Г.',
+    'г': 'Г',
+    'месяц': 'МЕСЯЦ',
+    'месяца': 'МЕСЯЦА',
+    'месяцев': 'МЕСЯЦЕВ',
+    'месяце': 'МЕСЯЦЕ',
+    'мес': 'МЕС',
+    'мес.': 'МЕС.',
+}
+
+DURATION_WORD_PATTERN = re.compile(r'\b(' + '|'.join(re.escape(k) for k in DURATION_WORD_REPLACEMENTS.keys()) + r')\b', re.IGNORECASE)
+
+DEFAULT_FONT_NAME = "Calibri Light"
+DEFAULT_FONT_SIZE_PT = 10.5
+BULLET_LEFT_INDENT_CM = 0.63
+
+
+def apply_default_font(run):
+    """Применяет шрифт Calibri Light 10.5 к run."""
+    run.font.name = DEFAULT_FONT_NAME
+    run.font.size = Pt(DEFAULT_FONT_SIZE_PT)
+    r_pr = run._element.get_or_add_rPr()
+    r_pr.rFonts.set(qn('w:eastAsia'), DEFAULT_FONT_NAME)
+
+
+def iter_container_paragraphs(container):
+    """Итерирует все параграфы в документе/ячейке, включая вложенные таблицы."""
+    if hasattr(container, 'paragraphs'):
+        for paragraph in container.paragraphs:
+            yield paragraph
+    if hasattr(container, 'tables'):
+        for table in container.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from iter_container_paragraphs(cell)
+
+
+def apply_default_font_to_document(doc):
+    """Проходит по всему документу и приводит текст к Calibri Light."""
+    for paragraph in iter_container_paragraphs(doc):
+        for run in paragraph.runs:
+            apply_default_font(run)
+
+
+def add_run_with_default_font(paragraph, text):
+    run = paragraph.add_run(text)
+    apply_default_font(run)
+    return run
+
+
+def configure_bullet_paragraph(paragraph):
+    paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+    paragraph.paragraph_format.left_indent = Cm(BULLET_LEFT_INDENT_CM)
+    paragraph.paragraph_format.first_line_indent = Cm(0)
+    remove_paragraph_numbering(paragraph)
+
+
+def ensure_runs_not_bold(paragraph):
+    for run in paragraph.runs:
+        run.font.bold = False
+        run.bold = False
+
+
+def write_label_and_value(paragraph, label_text, value_text):
+    template_run = paragraph.runs[0] if paragraph.runs else None
+    paragraph.clear()
+    if label_text:
+        if template_run:
+            label_run = paragraph.add_run(label_text)
+            clone_run_formatting(template_run, label_run)
+        else:
+            label_run = add_run_with_default_font(paragraph, label_text)
+        if not label_text.endswith(' '):
+            if template_run:
+                spacer = paragraph.add_run(' ')
+                clone_run_formatting(template_run, spacer)
+            else:
+                add_run_with_default_font(paragraph, ' ')
+    if value_text:
+        add_run_with_default_font(paragraph, value_text)
+
+
+def normalize_label_value_format(paragraph, template_para=None):
+    """Делит параграф на метку и значение, оставляя значение без жирного начертания."""
+    full_text = paragraph.text or ""
+    if ':' not in full_text:
+        return
+    colon_idx = full_text.find(':')
+    label_text = full_text[:colon_idx + 1].rstrip()
+    remainder = full_text[colon_idx + 1:]
+    value_text = remainder.strip()
+
+    template_run = None
+    if template_para and template_para.runs:
+        template_run = template_para.runs[0]
+
+    paragraph.clear()
+    if label_text:
+        if template_run:
+            label_run = paragraph.add_run(label_text)
+            clone_run_formatting(template_run, label_run)
+        else:
+            add_run_with_default_font(paragraph, label_text)
+        if value_text:
+            add_run_with_default_font(paragraph, ' ')
+    if value_text:
+        add_run_with_default_font(paragraph, value_text)
+
+
+def normalize_bullet_items(items, placeholders=None):
+    placeholders = placeholders or []
+    normalized = []
+    for item in items or []:
+        text = format_list_item(item) if isinstance(item, dict) else str(item)
+        text = text.replace('•', '').strip()
+        if text and text not in placeholders:
+            normalized.append(text)
+    return normalized
+
+
+def set_bullet_list_in_cell(cell, items):
+    if cell is None:
+        return False
+    normalized = normalize_bullet_items(items)
+    for para in cell.paragraphs[1:]:
+        para._element.getparent().remove(para._element)
+    target_para = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph("")
+    target_para.clear()
+    if not normalized:
+        remove_paragraph_numbering(target_para)
+        return False
+    for idx, text in enumerate(normalized):
+        current_para = target_para if idx == 0 else cell.add_paragraph("")
+        configure_bullet_paragraph(current_para)
+        add_run_with_default_font(current_para, f"• {text}")
+    return True
+
+
+def set_labeled_bullet_list(cell, fallback_label, items):
+    if cell is None:
+        return False
+    normalized = normalize_bullet_items(items)
+    if not cell.paragraphs:
+        cell.add_paragraph("")
+    label_para = cell.paragraphs[0]
+    label_run = label_para.runs[0] if label_para.runs else None
+    label_text = fallback_label
+    para_text = label_para.text.strip()
+    colon_idx = para_text.find(':')
+    if colon_idx != -1:
+        label_text = para_text[:colon_idx + 1]
+    label_para.clear()
+    if label_run:
+        new_label = label_para.add_run(label_text)
+        clone_run_formatting(label_run, new_label)
+    else:
+        add_run_with_default_font(label_para, label_text)
+    # Удаляем остальные параграфы
+    for para in cell.paragraphs[1:]:
+        para._element.getparent().remove(para._element)
+    if not normalized:
+        return False
+    for text in normalized:
+        bullet_para = cell.add_paragraph("")
+        configure_bullet_paragraph(bullet_para)
+        add_run_with_default_font(bullet_para, f"• {text}")
+    return True
+
+
+def set_bullet_list_in_document(doc, indices, items):
+    if not indices:
+        return False
+    normalized = normalize_bullet_items(items)
+    if not normalized:
+        return False
+    sorted_indices = sorted(set(idx for idx in indices if idx is not None))
+    if not sorted_indices:
+        return False
+    base_idx = sorted_indices[0]
+    for idx in reversed(sorted_indices[1:]):
+        if idx < len(doc.paragraphs):
+            para = doc.paragraphs[idx]
+            para._element.getparent().remove(para._element)
+    if base_idx >= len(doc.paragraphs):
+        return False
+    current_para = doc.paragraphs[base_idx]
+    current_para.clear()
+    for i, text in enumerate(normalized):
+        if i > 0:
+            current_para = current_para.insert_paragraph_after()
+        configure_bullet_paragraph(current_para)
+        add_run_with_default_font(current_para, f"• {text}")
+    return True
 
 
 def load_json(json_path):
@@ -60,7 +285,7 @@ def find_placeholder_runs(paragraph, placeholder):
     return indices
 
 
-def replace_text_preserving_format(paragraph, old_text, new_text):
+def replace_text_preserving_format(paragraph, old_text, new_text, force_default_font=True):
     """
     Заменяет текст в параграфе, сохраняя форматирование.
     Использует простой подход: заменяет весь текст параграфа, сохраняя форматирование первого run.
@@ -129,7 +354,9 @@ def replace_text_preserving_format(paragraph, old_text, new_text):
         target_run.font.underline = font_underline
     if font_color_rgb:
         target_run.font.color.rgb = font_color_rgb
-    
+    if force_default_font and new_text:
+        apply_default_font(target_run)
+
     return True
 
 
@@ -186,87 +413,227 @@ def set_paragraph_text(paragraph, text, template_para=None):
     for run in reversed(paragraph.runs):
         paragraph._element.remove(run._element)
     
-    new_run = paragraph.add_run(text)
+    new_run = add_run_with_default_font(paragraph, text)
     if template_para and template_para.runs:
         clone_run_formatting(template_para.runs[0], new_run)
 
 
-def find_template_block(doc, start_marker, end_marker):
-    """
-    Находит блок параграфов между маркерами.
-    
-    Args:
-        doc: Документ
-        start_marker (str): Начальный маркер (например, "{{#work_experience}}")
-        end_marker (str): Конечный маркер (например, "{{/work_experience}}")
-        
-    Returns:
-        tuple: (start_index, end_index, paragraphs) или None
-    """
-    start_idx = None
-    end_idx = None
-    
-    for i, para in enumerate(doc.paragraphs):
-        if start_marker in para.text:
-            start_idx = i
-        if end_idx is None and start_idx is not None and end_marker in para.text:
-            end_idx = i
+def uppercase_duration_words(text):
+    """Выделяет слова про длительности (год, месяц) капсом."""
+    if not text:
+        return text
+
+    def replacer(match):
+        word = match.group(0)
+        return DURATION_WORD_REPLACEMENTS.get(word.lower(), word.upper())
+
+    return DURATION_WORD_PATTERN.sub(replacer, text)
+
+
+def _parse_single_date(text_value):
+    """Преобразует строку вида 'Январь 2020' или 'настоящее время' в date."""
+    if not text_value:
+        return None
+    value = text_value.strip().lower()
+    if not value:
+        return None
+    if any(term in value for term in CURRENT_PERIOD_TERMS):
+        today = date.today()
+        return date(today.year, today.month, 1)
+
+    year_match = re.search(r'(19|20)\d{2}', value)
+    if not year_match:
+        return None
+    year = int(year_match.group(0))
+    month = 1
+    for name, number in MONTHS_MAP.items():
+        if name in value:
+            month = number
             break
-    
-    if start_idx is not None and end_idx is not None:
-        return (start_idx, end_idx, doc.paragraphs[start_idx:end_idx + 1])
-    return None
+    return date(year, month, 1)
 
 
-def process_simple_fields(doc, data):
-    """
-    Обрабатывает простые поля (не массивы).
-    
-    Args:
-        doc: Документ
-        data (dict): Данные из JSON
-        
-    Returns:
-        int: Количество замененных полей
-    """
-    # Обрабатываем простые поля верхнего уровня
-    simple_fields = {
-        'vacancy': data.get('vacancy', ''),
-        'pitch': data.get('pitch', ''),
-    }
-    
-    # Обрабатываем general_info
-    general_info = data.get('general_info', {})
-    simple_fields.update({
-        'foreign_language': general_info.get('foreign_language', ''),
-        'citizenship_location': general_info.get('citizenship_location', ''),
-        'employment': general_info.get('employment', ''),
-        'status': general_info.get('status', ''),
-    })
-    
-    replaced_count = 0
-    for field_name, field_value in simple_fields.items():
-        placeholder = f"{{{{{field_name}}}}}"
-        value_str = str(field_value) if field_value else ""
-        
-        # Ищем в параграфах
-        for para in doc.paragraphs:
-            if placeholder in para.text:
-                if replace_text_preserving_format(para, placeholder, value_str):
-                    replaced_count += 1
-                    print(f"  ✓ {field_name}: {value_str[:50] if value_str else '(пусто)'}")
-        
-        # Также проверяем таблицы
+def parse_period_range(period_str):
+    """Возвращает (start_date, end_date) из строки периода."""
+    if not period_str:
+        return (None, None)
+    parts = re.split(r'[\u2013\u2014\-]+', period_str)
+    start_part = parts[0].strip() if parts else period_str.strip()
+    end_part = parts[1].strip() if len(parts) > 1 else ''
+    start_date = _parse_single_date(start_part)
+    if end_part:
+        end_date = _parse_single_date(end_part)
+        if not end_date:
+            end_date = date.today()
+    else:
+        end_date = date.today()
+    return (start_date, end_date)
+
+
+def calculate_experience_months(work_experience):
+    """Суммирует продолжительность всех мест работы в месяцах."""
+    total_months = 0
+    for item in work_experience or []:
+        period = item.get('period', '')
+        start_date, end_date = parse_period_range(period)
+        if not start_date:
+            continue
+        if not end_date:
+            end_date = date.today()
+        months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+        if months < 0:
+            continue
+        total_months += max(months, 0)
+    return total_months
+
+
+def format_experience_summary(work_experience):
+    """Возвращает строку с опытом вида '8 ЛЕТ 3 МЕСЯЦА'."""
+    total_months = calculate_experience_months(work_experience)
+    if total_months <= 0:
+        return "МЕНЕЕ 1 МЕСЯЦА"
+    years = total_months // 12
+    months = total_months % 12
+    parts = []
+    if years:
+        if years % 10 == 1 and years % 100 != 11:
+            word = 'ГОД'
+        elif 2 <= years % 10 <= 4 and not 12 <= years % 100 <= 14:
+            word = 'ГОДА'
+        else:
+            word = 'ЛЕТ'
+        parts.append(f"{years} {word}")
+    if months:
+        if months % 10 == 1 and months % 100 != 11:
+            month_word = 'МЕСЯЦ'
+        elif 2 <= months % 10 <= 4 and not 12 <= months % 100 <= 14:
+            month_word = 'МЕСЯЦА'
+        else:
+            month_word = 'МЕСЯЦЕВ'
+        parts.append(f"{months} {month_word}")
+    return ' '.join(parts) if parts else "МЕНЕЕ 1 МЕСЯЦА"
+
+
+def fill_label_paragraph(doc, label_variants, value, uppercase_value=False):
+    """Находит параграф с меткой и подставляет значение после неё без наследования форматирования."""
+    if not value:
+        return False
+    value_text = str(value).strip()
+    if not value_text:
+        return False
+    if uppercase_value:
+        value_text = value_text.upper()
+
+    labels = label_variants if isinstance(label_variants, (list, tuple)) else [label_variants]
+    labels_upper = [lbl.upper() for lbl in labels]
+
+    def iter_paragraphs():
+        for paragraph in doc.paragraphs:
+            yield paragraph
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
-                    for para in cell.paragraphs:
-                        if placeholder in para.text:
-                            if replace_text_preserving_format(para, placeholder, value_str):
-                                replaced_count += 1
-                                print(f"  ✓ {field_name} (в таблице): {value_str[:50] if value_str else '(пусто)'}")
-    
-    return replaced_count
+                    for paragraph in cell.paragraphs:
+                        yield paragraph
+
+    for para in iter_paragraphs():
+        para_text = para.text.strip()
+        if not para_text:
+            continue
+        para_upper = para_text.upper()
+        if any(para_upper.startswith(lbl) for lbl in labels_upper):
+            colon_idx = para.text.find(':')
+            if colon_idx != -1:
+                label_text = para.text[:colon_idx + 1]
+            else:
+                label_text = para.text.strip()
+            write_label_and_value(para, label_text, value_text)
+            return True
+    return False
+
+
+def normalize_category_name(name):
+    """Приводит название категории к формату: первое слово с заглавной буквы, остальные строчные."""
+    if not name:
+        return ''
+    words = name.strip().split()
+    if not words:
+        return ''
+    normalized = [words[0].capitalize()]
+    normalized.extend(word.lower() for word in words[1:])
+    return ' '.join(normalized)
+
+
+def remove_paragraph_numbering(paragraph):
+    """Убирает нумерацию/маркеры из параграфа."""
+    pPr = paragraph._element.pPr
+    if pPr is not None and pPr.numPr is not None:
+        pPr.remove(pPr.numPr)
+
+
+def find_value_cell_for_header(doc, header_keywords):
+    """Возвращает ячейку таблицы с данными после заголовка."""
+    keywords = header_keywords if isinstance(header_keywords, (list, tuple)) else [header_keywords]
+    keywords = [kw.lower() for kw in keywords]
+    for table in doc.tables:
+        for row in table.rows:
+            if not row.cells:
+                continue
+            header_cell = row.cells[0]
+            header_text = ' '.join(p.text.strip() for p in header_cell.paragraphs).strip().lower()
+            if any(keyword in header_text for keyword in keywords):
+                if len(row.cells) > 1:
+                    return row.cells[1]
+                return row.cells[0]
+    return None
+
+
+def fill_skills_section(doc, skills):
+    """Заполняет блок Навыки и инструменты без маркеров, делая категории жирными."""
+    if not skills:
+        return False
+    cell = find_value_cell_for_header(doc, ['навыки и инструменты', 'skills and tools'])
+    if cell is None:
+        return False
+
+    # Готовим ячейку: оставляем только первый параграф
+    first_para = cell.paragraphs[0]
+    first_para.clear()
+    remove_paragraph_numbering(first_para)
+    # Удаляем остальные параграфы
+    for para in cell.paragraphs[1:]:
+        para._element.getparent().remove(para._element)
+
+    added = 0
+    for idx, item in enumerate(skills):
+        if isinstance(item, dict):
+            item_text = format_list_item(item)
+        else:
+            item_text = str(item)
+        item_text = item_text.strip()
+        if not item_text:
+            continue
+
+        if ':' in item_text:
+            category, details = item_text.split(':', 1)
+        else:
+            category, details = item_text, ''
+        category = normalize_category_name(category.strip())
+        details = details.strip()
+
+        para = first_para if added == 0 else cell.add_paragraph()
+        remove_paragraph_numbering(para)
+        if category:
+            label_text = category + (':' if details else '')
+            category_run = add_run_with_default_font(para, label_text)
+            category_run.bold = True
+            if details:
+                add_run_with_default_font(para, f" {details}")
+        else:
+            add_run_with_default_font(para, details)
+        added += 1
+
+    return added > 0
 
 
 def format_list_item(item):
@@ -301,39 +668,72 @@ def format_list_item(item):
     return str(item)
 
 
+def find_template_block(doc, start_marker, end_marker):
+    """Находит блок параграфов между маркерами."""
+    start_idx = None
+    end_idx = None
+    for i, para in enumerate(doc.paragraphs):
+        if start_marker in para.text:
+            start_idx = i
+        if end_idx is None and start_idx is not None and end_marker in para.text:
+            end_idx = i
+            break
+    if start_idx is not None and end_idx is not None:
+        return (start_idx, end_idx, doc.paragraphs[start_idx:end_idx + 1])
+    return None
+
+
+def process_simple_fields(doc, data):
+    """Обрабатывает простые поля (не массивы)."""
+    simple_fields = {
+        'vacancy': data.get('vacancy', ''),
+        'pitch': data.get('pitch', ''),
+    }
+    general_info = data.get('general_info', {})
+    simple_fields.update({
+        'foreign_language': general_info.get('foreign_language', ''),
+        'citizenship_location': general_info.get('citizenship_location', ''),
+        'employment': general_info.get('employment', ''),
+        'status': general_info.get('status', ''),
+    })
+
+    replaced_count = 0
+    for field_name, field_value in simple_fields.items():
+        placeholder = f"{{{{{field_name}}}}}"
+        value_str = str(field_value) if field_value else ""
+
+        for para in doc.paragraphs:
+            if placeholder in para.text and replace_text_preserving_format(para, placeholder, value_str):
+                replaced_count += 1
+                print(f"  ✓ {field_name}: {value_str[:50] if value_str else '(пусто)'}")
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        if placeholder in para.text and replace_text_preserving_format(para, placeholder, value_str):
+                            replaced_count += 1
+                            print(f"  ✓ {field_name} (в таблице): {value_str[:50] if value_str else '(пусто)'}")
+
+    return replaced_count
+
+
 def process_list_field(doc, data, field_path, placeholder_name):
-    """
-    Обрабатывает поле-список (массив строк).
-    
-    Args:
-        doc: Документ
-        data (dict): Данные из JSON
-        field_path (list): Путь к полю (например, ['general_info', 'skills_and_tools'])
-        placeholder_name (str): Имя плейсхолдера (например, 'skills_and_tools')
-        
-    Returns:
-        int: 1 если поле обработано, 0 если нет
-    """
-    # Получаем значение по пути
+    """Обрабатывает поле-список (массив строк)."""
     value = data
     for key in field_path:
         value = value.get(key, {})
-    
     if not isinstance(value, list):
         return 0
-    
-    # Находим маркеры начала и конца списка
+
     start_marker = f"{{{{#{placeholder_name}}}}}"
     end_marker = f"{{{{/{placeholder_name}}}}}"
-    
     block = find_template_block(doc, start_marker, end_marker)
     if not block:
-        # Если блок не найден, ищем простой плейсхолдер
         placeholder = f"{{{{{placeholder_name}}}}}"
         found = False
         for para in doc.paragraphs:
             if placeholder in para.text:
-                # Если это skills_and_tools и элементы содержат ":" (категории), форматируем без маркеров
                 if placeholder_name == 'skills_and_tools' and value and any(':' in str(item) for item in value):
                     list_text = "\n\n".join([format_list_item(item) for item in value]) if value else ""
                 else:
@@ -344,72 +744,51 @@ def process_list_field(doc, data, field_path, placeholder_name):
             print(f"  ✓ {placeholder_name}: {len(value)} элементов (простой плейсхолдер)")
             return 1
         return 0
-    
+
     start_idx, end_idx, template_paras = block
-    
-    # Удаляем маркеры
     for para in template_paras:
         if start_marker in para.text:
             replace_text_preserving_format(para, start_marker, "")
         if end_marker in para.text:
             replace_text_preserving_format(para, end_marker, "")
-    
-    # Если есть элементы списка, клонируем шаблон
+
     if value and len(value) > 0:
-        # Находим шаблонный параграф (между маркерами, но не сами маркеры)
         template_para = None
         for para in template_paras:
             if start_marker not in para.text and end_marker not in para.text and para.text.strip():
                 template_para = para
                 break
-        
+
         if template_para:
-            # Удаляем старые параграфы между маркерами (кроме первого и последнего)
             for i in range(end_idx - 1, start_idx, -1):
                 if i < len(doc.paragraphs):
                     doc.paragraphs[i]._element.getparent().remove(doc.paragraphs[i]._element)
-            
-            # Вставляем новые параграфы для каждого элемента
+
             insert_idx = start_idx + 1
-            is_skills_with_categories = placeholder_name == 'skills_and_tools' and value and any(':' in str(item) for item in value)
-            
-            for i, item in enumerate(value):
+            is_with_categories = placeholder_name == 'skills_and_tools' and value and any(':' in str(item) for item in value)
+
+            for item in value:
                 new_para = doc.paragraphs[insert_idx].insert_paragraph_before()
                 clone_paragraph_formatting(template_para, new_para)
-                
-                # Форматируем элемент (для словарей)
                 formatted_item = format_list_item(item)
-                
-                # Для skills_and_tools с категориями (содержат ":") - без маркера списка
-                # Для остальных - с маркером, если он был в шаблоне
-                if is_skills_with_categories and ':' in str(formatted_item):
-                    # Просто вставляем текст без маркера
+
+                if is_with_categories and ':' in str(formatted_item):
                     if template_para.runs:
                         for source_run in template_para.runs:
                             new_run = new_para.add_run(formatted_item)
                             clone_run_formatting(source_run, new_run)
                     else:
                         new_para.add_run(formatted_item)
-                    
-                    # Добавляем пустую строку после категории (кроме последней)
-                    if i < len(value) - 1:
-                        insert_idx += 1
-                        empty_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-                        clone_paragraph_formatting(template_para, empty_para)
                 else:
-                    # Обычное форматирование с маркером, если он был в шаблоне
                     if template_para.runs:
                         for source_run in template_para.runs:
-                            # Проверяем, есть ли маркер в шаблоне
                             template_text = template_para.text.strip()
-                            if template_text.startswith('•') or template_text.startswith('-'):
-                                new_run = new_para.add_run(f"• {formatted_item}")
-                            else:
-                                new_run = new_para.add_run(formatted_item)
+                            text_value = f"• {formatted_item}" if template_text.startswith(('•', '-')) else formatted_item
+                            new_run = new_para.add_run(text_value)
                             clone_run_formatting(source_run, new_run)
                     else:
                         new_para.add_run(formatted_item)
-                
+
                 insert_idx += 1
             print(f"  ✓ {placeholder_name}: {len(value)} элементов")
             return 1
@@ -417,185 +796,142 @@ def process_list_field(doc, data, field_path, placeholder_name):
 
 
 def process_work_experience(doc, data):
-    """
-    Обрабатывает блок опыта работы.
-    
-    Args:
-        doc: Документ
-        data (dict): Данные из JSON
-        
-    Returns:
-        int: Количество добавленных записей опыта работы
-    """
+    """Обрабатывает блок опыта работы."""
     work_experience = data.get('work_experience', [])
     if not work_experience:
         return 0
-    
+
     start_marker = "{{#work_experience}}"
     end_marker = "{{/work_experience}}"
-    
     block = find_template_block(doc, start_marker, end_marker)
     if not block:
         print(f"  ⚠️  Блок {start_marker}...{end_marker} не найден в шаблоне")
         return 0
-    
+
     start_idx, end_idx, template_paras = block
-    
-    # Находим шаблонные параграфы (между маркерами)
     template_paras_clean = [p for p in template_paras if start_marker not in p.text and end_marker not in p.text]
-    
     if not template_paras_clean:
-        return
-    
-    # Удаляем маркеры
+        return 0
+
     for para in doc.paragraphs:
         if start_marker in para.text:
             replace_text_preserving_format(para, start_marker, "")
         if end_marker in para.text:
             replace_text_preserving_format(para, end_marker, "")
-    
-    # Удаляем старые параграфы между маркерами
+
     for i in range(end_idx - 1, start_idx, -1):
         if i < len(doc.paragraphs):
             doc.paragraphs[i]._element.getparent().remove(doc.paragraphs[i]._element)
-    
-    # Вставляем блоки для каждого места работы
+
     insert_idx = start_idx + 1
     added_count = 0
     for work_item in work_experience:
-        # Клонируем все шаблонные параграфы
         for template_para in template_paras_clean:
             new_para = doc.paragraphs[insert_idx].insert_paragraph_before()
             clone_paragraph_formatting(template_para, new_para)
-            
-            # Заменяем плейсхолдеры в новом параграфе
+
             para_text = template_para.text
-            
-            # Заменяем простые поля
             replacements = {
                 '{{company}}': work_item.get('company', ''),
                 '{{position}}': work_item.get('position', ''),
                 '{{period}}': work_item.get('period', ''),
             }
-            
             for placeholder, value in replacements.items():
                 if placeholder in para_text:
                     para_text = para_text.replace(placeholder, str(value))
-            
-            # Устанавливаем текст с сохранением форматирования
+
             set_paragraph_text(new_para, para_text, template_para)
-            
-            # Обрабатываем списки (responsibilities, technologies)
+
             if '{{responsibilities}}' in para_text:
                 responsibilities = work_item.get('responsibilities', [])
                 list_text = "\n".join([f"• {item}" for item in responsibilities]) if responsibilities else ""
                 replace_text_preserving_format(new_para, '{{responsibilities}}', list_text)
-            
+
             if '{{technologies}}' in para_text:
                 technologies = work_item.get('technologies', [])
                 if technologies:
-                    # Если технологии уже в формате "Категория: технологии", используем как есть
-                    # Иначе объединяем через запятую
                     tech_text = '\n'.join(technologies) if any(':' in t for t in technologies) else ", ".join(technologies)
                 else:
                     tech_text = ""
                 replace_text_preserving_format(new_para, '{{technologies}}', tech_text)
-            
+
             insert_idx += 1
         added_count += 1
-        company = work_item.get('company', 'Не указано')
-        position = work_item.get('position', 'Не указано')
-        print(f"  ✓ Опыт работы: {company} - {position}")
-    
+        print(f"  ✓ Опыт работы: {work_item.get('company', 'Не указано')} - {work_item.get('position', 'Не указано')}")
+
     return added_count
 
 
 def process_project_experience(doc, data):
-    """
-    Обрабатывает блок проектного опыта.
-    
-    Args:
-        doc: Документ
-        data (dict): Данные из JSON
-        
-    Returns:
-        int: Количество добавленных записей проектного опыта
-    """
+    """Обрабатывает блок проектного опыта."""
     project_experience = data.get('project_experience', [])
     if not project_experience:
         return 0
-    
+
     start_marker = "{{#project_experience}}"
     end_marker = "{{/project_experience}}"
-    
     block = find_template_block(doc, start_marker, end_marker)
     if not block:
         print(f"  ⚠️  Блок {start_marker}...{end_marker} не найден в шаблоне")
         return 0
-    
+
     start_idx, end_idx, template_paras = block
-    
-    # Находим шаблонные параграфы
     template_paras_clean = [p for p in template_paras if start_marker not in p.text and end_marker not in p.text]
-    
     if not template_paras_clean:
-        return
-    
-    # Удаляем маркеры
+        return 0
+
     for para in doc.paragraphs:
         if start_marker in para.text:
             replace_text_preserving_format(para, start_marker, "")
         if end_marker in para.text:
             replace_text_preserving_format(para, end_marker, "")
-    
-    # Удаляем старые параграфы
+
     for i in range(end_idx - 1, start_idx, -1):
         if i < len(doc.paragraphs):
             doc.paragraphs[i]._element.getparent().remove(doc.paragraphs[i]._element)
-    
-    # Вставляем блоки для каждого проекта
+
     insert_idx = start_idx + 1
     added_count = 0
     for project_item in project_experience:
         for template_para in template_paras_clean:
             new_para = doc.paragraphs[insert_idx].insert_paragraph_before()
             clone_paragraph_formatting(template_para, new_para)
-            
+
             para_text = template_para.text
-            
+            template_text = template_para.text
+            has_role_placeholder = "{{role}}" in template_text
+            has_tech_placeholder = "{{technologies_and_tools}}" in template_text
             replacements = {
                 '{{company}}': project_item.get('company', ''),
                 '{{role}}': project_item.get('role', ''),
             }
-            
             for placeholder, value in replacements.items():
                 if placeholder in para_text:
                     para_text = para_text.replace(placeholder, str(value))
-            
+
             set_paragraph_text(new_para, para_text, template_para)
-            
-            # Обрабатываем списки
+            if has_role_placeholder:
+                normalize_label_value_format(new_para, template_para)
+
             if '{{tasks}}' in para_text:
                 tasks = project_item.get('tasks', [])
                 tasks_text = "\n".join([f"• {item}" for item in tasks]) if tasks else ""
                 replace_text_preserving_format(new_para, '{{tasks}}', tasks_text)
-            
+
             if '{{technologies_and_tools}}' in para_text:
                 tech = project_item.get('technologies_and_tools', [])
                 if tech:
-                    # Если технологии уже в формате "Категория: технологии", используем как есть
-                    # Иначе объединяем через запятую
                     tech_text = '\n'.join(tech) if any(':' in t for t in tech) else ", ".join(tech)
                 else:
                     tech_text = ""
                 replace_text_preserving_format(new_para, '{{technologies_and_tools}}', tech_text)
-            
+                if has_tech_placeholder:
+                    normalize_label_value_format(new_para, template_para)
+
             insert_idx += 1
         added_count += 1
-        company = project_item.get('company', 'Не указано')
-        role = project_item.get('role', 'Не указано')
-        print(f"  ✓ Проект: {company} - {role}")
-    
+        print(f"  ✓ Проект: {project_item.get('company', 'Не указано')} - {project_item.get('role', 'Не указано')}")
+
     return added_count
 
 
@@ -695,8 +1031,12 @@ def find_empty_paragraph_after_header(doc, header_keywords, max_search=15):
         # Проверяем, не является ли найденная ячейка заголовком
         header_text = ' '.join([p.text.strip() for p in header_cell.paragraphs]).lower()
         is_header = any(kw.lower() in header_text for kw in header_keywords)
-        
-        if is_header:
+        row = table.rows[row_idx]
+        single_cell_row = len(row.cells) == 1
+        if is_header and single_cell_row and header_cell.paragraphs:
+            return ('table_cell', header_cell.paragraphs[0])
+
+        if is_header and not single_cell_row:
             # Если это заголовок, ищем следующую ячейку в строке или следующую строку
             # Сначала пробуем следующую ячейку в той же строке
             if cell_idx + 1 < len(table.rows[row_idx].cells):
@@ -705,8 +1045,12 @@ def find_empty_paragraph_after_header(doc, header_keywords, max_search=15):
                     text = para.text.strip()
                     if not text or text in ['', '—', '-', '•'] or '{{' in text:
                         return ('table_cell', para)
+                # Если ячейка не содержит пустых параграфов, используем первый или создаем новый
                 if next_cell.paragraphs:
                     return ('table_cell', next_cell.paragraphs[0])
+                else:
+                    new_para = next_cell.add_paragraph("")
+                    return ('table_cell', new_para)
             
             # Если следующей ячейки нет, ищем следующую строку
             if row_idx + 1 < len(table.rows):
@@ -718,6 +1062,9 @@ def find_empty_paragraph_after_header(doc, header_keywords, max_search=15):
                             return ('table_cell', para)
                     if next_row_cell.paragraphs:
                         return ('table_cell', next_row_cell.paragraphs[0])
+                    else:
+                        new_para = next_row_cell.add_paragraph("")
+                        return ('table_cell', new_para)
         
         # Ищем в самой ячейке (если это не заголовок)
         for para in header_cell.paragraphs:
@@ -728,9 +1075,8 @@ def find_empty_paragraph_after_header(doc, header_keywords, max_search=15):
             if not text or text in ['', '—', '-', '•'] or '{{' in text:
                 return ('table_cell', para)
         
-        # Если не нашли, возвращаем последний параграф в ячейке (или создаем новый)
-        if header_cell.paragraphs:
-            return ('table_cell', header_cell.paragraphs[-1])
+        # Если не нашли, создаем новый параграф в той же ячейке после заголовка
+        return ('table_cell', header_cell.add_paragraph(""))
     
     return None
 
@@ -760,6 +1106,7 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
     
     if debug:
         print(f"  🔍 Найден параграф для '{field_name}': '{para.text[:50]}' (тип: {target_type})")
+    placeholder_texts = ['', '—', '-', '•', 'Место для указания вакансии', 'Рассказ о себе от первого лица']
     
     # Если параграф содержит плейсхолдер, заменяем его
     if '{{' in para.text:
@@ -777,11 +1124,66 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
     is_header = any(kw.lower() in old_text_lower for kw in header_keywords)
     
     if is_header:
-        # Если это заголовок, ищем следующий параграф
+        if target_type == 'table_cell':
+            cell = para._parent
+            table = getattr(cell, '_parent', None)
+            row = None
+            row_idx = None
+            col_idx = 0
+            if table is not None:
+                for idx, tbl_row in enumerate(table.rows):
+                    for c_idx, candidate_cell in enumerate(tbl_row.cells):
+                        if candidate_cell._tc is cell._tc:
+                            row = tbl_row
+                            row_idx = idx
+                            col_idx = c_idx
+                            break
+                    if row is not None:
+                        break
+            cells_in_row = len(row.cells) if row is not None else 1
+            if cells_in_row == 1:
+                target_para = None
+                if table is not None and row_idx is not None and row_idx + 1 < len(table.rows):
+                    next_row = table.rows[row_idx + 1]
+                    if col_idx < len(next_row.cells):
+                        next_cell = next_row.cells[col_idx]
+                        next_text = ' '.join([p.text.strip() for p in next_cell.paragraphs]).strip()
+                        if not next_text or next_text in placeholder_texts or '{{' in next_text:
+                            if next_cell.paragraphs:
+                                target_para = next_cell.paragraphs[0]
+                            else:
+                                target_para = next_cell.add_paragraph("")
+                if target_para:
+                    target_para.clear()
+                    add_run_with_default_font(target_para, value_str)
+                    if debug:
+                        print(f"  ✅ Добавлен текст под заголовком в следующей строке: '{value_str[:50]}'")
+                    return True
+                para.clear()
+                add_run_with_default_font(para, value_str)
+                if debug:
+                    print(f"  ✅ Заголовок заменен значением в той же ячейке: '{value_str[:50]}'")
+                return True
+            # Пытаемся найти дополнительный параграф в этой же ячейке
+            target_para = None
+            for idx, cell_para in enumerate(cell.paragraphs):
+                if cell_para == para:
+                    continue
+                text = cell_para.text.strip()
+                if not text or text in placeholder_texts or '{{' in text:
+                    target_para = cell_para
+                    break
+            if target_para is None:
+                target_para = cell.add_paragraph("")
+            target_para.clear()
+            add_run_with_default_font(target_para, value_str)
+            if debug:
+                print(f"  ✅ Добавлен текст в новую строку ячейки: '{value_str[:50]}'")
+            return True
+        # Если это заголовок в параграфе, ищем следующий параграф
         if debug:
             print(f"  ⚠️  Найденный текст является заголовком, ищем следующий параграф: '{old_text[:50]}'")
         # Пытаемся найти следующий параграф после заголовка
-        # Находим индекс текущего параграфа
         para_idx = None
         for i, p in enumerate(doc.paragraphs):
             if p == para:
@@ -789,22 +1191,18 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
                 break
         
         if para_idx is not None and para_idx + 1 < len(doc.paragraphs):
-            # Пробуем следующий параграф
             next_para = doc.paragraphs[para_idx + 1]
             next_text = next_para.text.strip()
             next_text_lower = next_text.lower()
-            # Если следующий параграф не заголовок, используем его
             if not any(kw.lower() in next_text_lower for kw in header_keywords):
-                # Также проверяем, не заголовок ли это другой секции
                 other_section_keywords = ['опыт работы', 'проектный опыт', 'общая информация', 'скрининг', 
                                          'образование', 'навыки', 'вакансия', 'work experience', 
                                          'project experience', 'general info', 'screening']
                 is_other_header = any(kw.lower() in next_text_lower for kw in other_section_keywords)
                 if not is_other_header:
-                    # Заменяем текст в следующем параграфе
-                    if next_text in ['', '—', '-', '•', 'Место для указания вакансии'] or '{{' in next_text:
+                    if next_text in placeholder_texts or '{{' in next_text:
                         next_para.clear()
-                        next_para.add_run(value_str)
+                        add_run_with_default_font(next_para, value_str)
                         if debug:
                             print(f"  ✅ Заполнен следующий параграф: '{value_str[:50]}'")
                         return True
@@ -820,7 +1218,7 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
     if old_text in ['Место для указания вакансии', '—', '-', '']:
         # Очищаем параграф и добавляем новый текст
         para.clear()
-        para.add_run(value_str)
+        add_run_with_default_font(para, value_str)
         if debug:
             print(f"  ✅ Заполнен пустой параграф: '{value_str[:50]}'")
         return True
@@ -832,7 +1230,7 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
         if not result:
             # Если замена не удалась, просто очищаем и добавляем новый текст
             para.clear()
-            para.add_run(value_str)
+            add_run_with_default_font(para, value_str)
             if debug:
                 print(f"  ✅ Заменено через очистку: '{value_str[:50]}'")
             return True
@@ -841,8 +1239,9 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
         # Если параграф пустой, добавляем текст
         if para.runs:
             para.runs[0].text = value_str
+            apply_default_font(para.runs[0])
         else:
-            para.add_run(value_str)
+            add_run_with_default_font(para, value_str)
         if debug:
             print(f"  ✅ Добавлен текст в пустой параграф: '{value_str[:50]}'")
         return True
@@ -867,7 +1266,6 @@ def fill_document(template_path, json_data, output_path):
         if '{{' in text and '}}' in text:
             placeholders = re.findall(r'\{\{([^}]+)\}\}', text)
             found_placeholders.extend(placeholders)
-    
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -876,9 +1274,9 @@ def fill_document(template_path, json_data, output_path):
                     if '{{' in text and '}}' in text:
                         placeholders = re.findall(r'\{\{([^}]+)\}\}', text)
                         found_placeholders.extend(placeholders)
-    
+
     has_placeholders = len(found_placeholders) > 0
-    
+
     if has_placeholders:
         print(f"Найдено плейсхолдеров в шаблоне: {len(set(found_placeholders))}")
         print(f"Уникальные плейсхолдеры: {', '.join(set(found_placeholders))}")
@@ -888,20 +1286,19 @@ def fill_document(template_path, json_data, output_path):
         print("Переключение на режим заполнения по заголовкам...")
         print("\n📋 Структура документа для отладки:")
         print("-" * 60)
-        for i, para in enumerate(doc.paragraphs[:20]):  # Показываем первые 20 параграфов
+        for i, para in enumerate(doc.paragraphs[:20]):
             text = para.text.strip()
             if text:
                 print(f"[{i:2d}] {text[:70]}")
         if len(doc.paragraphs) > 20:
             print(f"... и еще {len(doc.paragraphs) - 20} параграфов")
         print("-" * 60)
-    
+
     if has_placeholders:
-        # Режим с плейсхолдерами
         print("\nЗаполнение простых полей...")
         replaced_simple = process_simple_fields(doc, json_data)
         print(f"  Заполнено простых полей: {replaced_simple}")
-        
+
         print("\nЗаполнение списков...")
         replaced_lists = 0
         replaced_lists += process_list_field(doc, json_data, ['general_info', 'skills_and_tools'], 'skills_and_tools')
@@ -909,18 +1306,19 @@ def fill_document(template_path, json_data, output_path):
         replaced_lists += process_list_field(doc, json_data, ['screening', 'hard_skills'], 'hard_skills')
         replaced_lists += process_list_field(doc, json_data, ['screening', 'soft_skills'], 'soft_skills')
         print(f"  Заполнено списков: {replaced_lists}")
-        
+
         print("\nЗаполнение опыта работы...")
         work_count = process_work_experience(doc, json_data)
         print(f"  Добавлено записей опыта работы: {work_count}")
-        
+
         print("\nЗаполнение проектного опыта...")
         project_count = process_project_experience(doc, json_data)
         print(f"  Добавлено записей проектного опыта: {project_count}")
     else:
-        # Режим заполнения по заголовкам
         print("\nЗаполнение по заголовкам...")
         fill_by_headers_mode(doc, json_data, debug=True)
+
+    apply_default_font_to_document(doc)
     
     print(f"\nСохранение документа: {output_path}")
     
@@ -964,27 +1362,48 @@ def fill_by_headers_mode(doc, json_data, debug=False):
         debug (bool): Выводить отладочную информацию
     """
     replaced_count = 0
+    work_experience = json_data.get('work_experience', [])
+    general_info = json_data.get('general_info', {})
     
     # ФИО - простая замена текста "ФИО" на значение из JSON
     if json_data.get('full_name') or json_data.get('name'):
         full_name = json_data.get('full_name') or json_data.get('name', '')
         if full_name:
             # Ищем и заменяем текст "ФИО" во всех параграфах
+            full_name_value = full_name.upper()
             for para in doc.paragraphs:
                 if 'фио' in para.text.lower():
                     # Заменяем "ФИО" на значение
-                    replace_text_preserving_format(para, 'ФИО', full_name)
+                    replace_text_preserving_format(para, 'ФИО', full_name_value)
                     replaced_count += 1
-                    print(f"  ✓ ФИО: {full_name[:50]}")
+                    print(f"  ✓ ФИО: {full_name_value[:50]}")
                     break
-    
+
     # Вакансия - простая замена через плейсхолдер или текст
     if json_data.get('vacancy'):
-        vacancy_value = json_data['vacancy']
+        vacancy_value = json_data['vacancy'].upper()
         if fill_by_header(doc, ['вакансия', 'vacancy', 'позиция', 'место для указания'], 
                          vacancy_value, 'vacancy', debug=debug):
             replaced_count += 1
             print(f"  ✓ Вакансия: {vacancy_value[:50]}")
+
+    # ОПЫТ РАБОТЫ (суммарный стаж в годах/месяцах)
+    experience_summary = format_experience_summary(work_experience)
+    if experience_summary:
+        if fill_label_paragraph(doc, 'ОПЫТ РАБОТЫ', experience_summary, uppercase_value=True):
+            replaced_count += 1
+            print(f"  ✓ ОПЫТ РАБОТЫ: {experience_summary}")
+
+    # Проектный бекграунд (краткое описание)
+    project_background = (
+        json_data.get('project_background')
+        or json_data.get('project_background_summary')
+        or general_info.get('project_background')
+    )
+    if project_background:
+        if fill_label_paragraph(doc, 'ПРОЕКТНЫЙ БЭКГРАУНД', project_background, uppercase_value=False):
+            replaced_count += 1
+            print(f"  ✓ Проектный бекграунд")
     
     # Питч
     if json_data.get('pitch'):
@@ -1005,25 +1424,33 @@ def fill_by_headers_mode(doc, json_data, debug=False):
             print(f"  ⚠️  Не найден заголовок для поля 'pitch'")
     
     # Общая информация
-    general_info = json_data.get('general_info', {})
     
     # Навыки и инструменты
     skills = general_info.get('skills_and_tools', [])
     if skills:
-        if fill_list_by_header(doc, ['навыки и инструменты', 'skills and tools', 'skills_and_tools'], skills, 'skills_and_tools'):
+        filled_skills = fill_skills_section(doc, skills)
+        if not filled_skills:
+            filled_skills = fill_list_by_header(
+                doc,
+                ['навыки и инструменты', 'skills and tools', 'skills_and_tools'],
+                skills,
+                'skills_and_tools',
+                use_bullets=False
+            )
+        if filled_skills:
             replaced_count += 1
             print(f"  ✓ Навыки и инструменты: {len(skills)} элементов")
-    
+
     # Образование
     education = general_info.get('education', [])
     if education:
-        if fill_list_by_header(doc, ['образование', 'education'], education, 'education'):
+        if fill_list_by_header(doc, ['образование', 'education'], education, 'education', use_bullets=False):
             replaced_count += 1
             print(f"  ✓ Образование: {len(education)} элементов")
     
     # Иностранный язык
     if general_info.get('foreign_language'):
-        if fill_by_header(doc, ['иностранный язык', 'foreign language', 'foreign_language', 'язык'], 
+        if fill_by_header(doc, ['иностранный язык', 'foreign language', 'foreign_language'], 
                          general_info['foreign_language'], 'foreign_language', debug=debug):
             replaced_count += 1
             print(f"  ✓ Иностранный язык: {general_info['foreign_language']}")
@@ -1077,7 +1504,6 @@ def fill_by_headers_mode(doc, json_data, debug=False):
             print(f"  ⚠️  Не найден заголовок для списка 'soft_skills'")
     
     # Опыт работы
-    work_experience = json_data.get('work_experience', [])
     if work_experience:
         work_count = fill_work_experience_by_header(doc, work_experience)
         if work_count > 0:
@@ -1088,7 +1514,6 @@ def fill_by_headers_mode(doc, json_data, debug=False):
     all_projects = []
     
     # Собираем проекты из work_experience
-    work_experience = json_data.get('work_experience', [])
     for work_item in work_experience:
         # Если есть проекты в work_experience, используем их
         projects = work_item.get('projects', [])
@@ -1099,7 +1524,8 @@ def fill_by_headers_mode(doc, json_data, debug=False):
                     'company': f"{work_item.get('company', '')} / {work_item.get('period', '')}",
                     'role': project.get('role', work_item.get('position', '')),
                     'tasks': project.get('tasks', []),
-                    'technologies_and_tools': project.get('tools', project.get('technologies_and_tools', []))
+                    'technologies_and_tools': project.get('tools', project.get('technologies_and_tools', [])),
+                    'achievements': project.get('achievements', [])
                 }
                 all_projects.append(project_data)
         else:
@@ -1109,7 +1535,8 @@ def fill_by_headers_mode(doc, json_data, debug=False):
                     'company': f"{work_item.get('company', '')} / {work_item.get('period', '')}",
                     'role': work_item.get('position', ''),
                     'tasks': work_item.get('responsibilities', []),
-                    'technologies_and_tools': work_item.get('technologies', [])
+                    'technologies_and_tools': work_item.get('technologies', []),
+                    'achievements': work_item.get('achievements', [])
                 }
                 all_projects.append(project_data)
     
@@ -1223,7 +1650,7 @@ def fill_list_in_table_column(doc, section_keywords, column_keywords, items, fie
     return False
 
 
-def fill_list_by_header(doc, header_keywords, items, field_name, debug=False):
+def fill_list_by_header(doc, header_keywords, items, field_name, debug=False, use_bullets=True):
     """
     Заполняет список, ища его по заголовку.
     
@@ -1271,19 +1698,25 @@ def fill_list_by_header(doc, header_keywords, items, field_name, debug=False):
             if insert_idx >= len(doc.paragraphs):
                 # Создаем новый параграф
                 new_para = doc.paragraphs[-1].insert_paragraph_after()
-                new_para.add_run(f"• {formatted_item}")
+                remove_paragraph_numbering(new_para)
+                text_value = formatted_item if not use_bullets else f"• {formatted_item}"
+                new_para.add_run(text_value)
             else:
                 para = doc.paragraphs[insert_idx]
                 old_text = para.text.strip()
                 if not old_text or old_text in ['—', '-', '•', '']:
                     # Заполняем пустой параграф
                     para.clear()
-                    para.add_run(f"• {formatted_item}")
+                    remove_paragraph_numbering(para)
+                    text_value = formatted_item if not use_bullets else f"• {formatted_item}"
+                    para.add_run(text_value)
                 else:
                     # Вставляем новый параграф перед текущим
                     new_para = para.insert_paragraph_before()
-                    new_para.add_run(f"• {formatted_item}")
-        
+                    remove_paragraph_numbering(new_para)
+                    text_value = formatted_item if not use_bullets else f"• {formatted_item}"
+                    new_para.add_run(text_value)
+
         return True
     
     elif target_type == 'table_cell':
@@ -1294,16 +1727,20 @@ def fill_list_by_header(doc, header_keywords, items, field_name, debug=False):
             para._element.getparent().remove(para._element)
         
         first_para.clear()
+        remove_paragraph_numbering(first_para)
         for i, item in enumerate(items):
             formatted_item = format_list_item(item)
             if i == 0:
-                first_para.add_run(f"• {formatted_item}")
+                text_value = formatted_item if not use_bullets else f"• {formatted_item}"
+                first_para.add_run(text_value)
             else:
                 new_para = cell.add_paragraph()
-                new_para.add_run(f"• {formatted_item}")
-        
+                remove_paragraph_numbering(new_para)
+                text_value = formatted_item if not use_bullets else f"• {formatted_item}"
+                new_para.add_run(text_value)
+
         return True
-    
+
     return False
 
 
@@ -1368,11 +1805,11 @@ def fill_work_experience_by_header(doc, work_experience):
             # Вставляем информацию о работе
             company_para = doc.paragraphs[insert_idx].insert_paragraph_before()
             if position:
-                company_para.add_run(f"{position}")
+                add_run_with_default_font(company_para, f"{position}")
                 if company:
-                    company_para.add_run(f" в {company}")
+                    add_run_with_default_font(company_para, f" в {company}")
             else:
-                company_para.add_run(company)
+                add_run_with_default_font(company_para, company)
             insert_idx += 1
             
             # Период
@@ -1381,7 +1818,7 @@ def fill_work_experience_by_header(doc, work_experience):
                     doc.add_paragraph()
                     insert_idx = len(doc.paragraphs) - 1
                 period_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-                period_para.add_run(period)
+                add_run_with_default_font(period_para, period)
                 insert_idx += 1
             
             # Обязанности
@@ -1392,7 +1829,8 @@ def fill_work_experience_by_header(doc, work_experience):
                         doc.add_paragraph()
                         insert_idx = len(doc.paragraphs) - 1
                     resp_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-                    resp_para.add_run(f"• {resp}")
+                    configure_bullet_paragraph(resp_para)
+                    add_run_with_default_font(resp_para, f"• {resp}")
                     insert_idx += 1
             
             # Технологии
@@ -1402,7 +1840,7 @@ def fill_work_experience_by_header(doc, work_experience):
                     doc.add_paragraph()
                     insert_idx = len(doc.paragraphs) - 1
                 tech_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-                tech_para.add_run(f"Технологии: {', '.join(technologies)}")
+                add_run_with_default_font(tech_para, f"Технологии: {', '.join(technologies)}")
                 insert_idx += 1
             
             # Пустая строка между записями
@@ -1513,6 +1951,8 @@ def find_project_block_fields(doc, start_idx, max_search=20):
         'role_value': None,
         'tasks_label': None,
         'tasks_fields': [],  # Список индексов для задач
+        'achievements_label': None,
+        'achievements_fields': [],
         'tech_label': None,
         'tech_value': None
     }
@@ -1549,10 +1989,22 @@ def find_project_block_fields(doc, start_idx, max_search=20):
             for j in range(i + 1, min(i + 10, len(doc.paragraphs))):
                 next_para = doc.paragraphs[j]
                 next_text = next_para.text.strip().lower()
-                if 'технологии' in next_text or 'место работы' in next_text:
+                if 'достижения' in next_text or 'технологии' in next_text or 'место работы' in next_text:
                     break
                 if next_text and not any(kw in next_text for kw in ['задачи:', 'роль:', 'технологии:', 'место работы']):
                     fields['tasks_fields'].append(j)
+            continue
+
+        # Ищем "Достижения:"
+        if fields['achievements_label'] is None and 'достижения' in text_lower:
+            fields['achievements_label'] = i
+            for j in range(i + 1, min(i + 10, len(doc.paragraphs))):
+                next_para = doc.paragraphs[j]
+                next_text = next_para.text.strip().lower()
+                if 'технологии' in next_text or 'место работы' in next_text:
+                    break
+                if next_text and not any(kw in next_text for kw in ['задачи:', 'роль:', 'технологии:', 'место работы', 'достижения:']):
+                    fields['achievements_fields'].append(j)
             continue
         
         # Ищем "Технологии и инструменты:"
@@ -1775,6 +2227,8 @@ def find_project_block_fields_in_table_row(table, start_row_idx):
         'role_value': None,
         'tasks_label': None,
         'tasks_fields': [],
+        'achievements_label': None,
+        'achievements_fields': [],
         'tech_label': None,
         'tech_value': None
     }
@@ -1975,6 +2429,20 @@ def find_project_block_fields_in_table_row(table, start_row_idx):
                             print(f"              ✓ Найдено поле для задач: ({row_idx + 1}, {cell_idx})")
                 continue
             
+            # Достижения
+            if fields['achievements_label'] is None and 'достижения' in cell_text:
+                fields['achievements_label'] = (row_idx, cell_idx)
+                print(f"           ✓ Найдено 'Достижения:' в ({row_idx}, {cell_idx})")
+                if cell_idx + 1 < len(row.cells):
+                    fields['achievements_fields'].append((row_idx, cell_idx + 1))
+                    print(f"              ✓ Поле достижений: ({row_idx}, {cell_idx + 1})")
+                elif row_idx + 1 < len(table.rows):
+                    next_row = table.rows[row_idx + 1]
+                    if cell_idx < len(next_row.cells):
+                        fields['achievements_fields'].append((row_idx + 1, cell_idx))
+                        print(f"              ✓ Поле достижений: ({row_idx + 1}, {cell_idx})")
+                continue
+
             # Технологии и инструменты: - обычно в последней строке блока
             # ВАЖНО: может быть в одной ячейке с "Роль:" и "Задачи:"
             if fields['tech_label'] is None and ('технологии и инструменты' in cell_text or 'технологии:' in cell_text):
@@ -2080,20 +2548,21 @@ def fill_single_project_block(doc, block_fields, project_item):
     company = project_item.get('company', '').strip()
     role = project_item.get('role', '').strip()
     tasks = project_item.get('tasks', [])
+    achievements = project_item.get('achievements') or project_item.get('achievements_and_results', [])
     technologies = project_item.get('technologies_and_tools', [])
         
     # 1. Место работы / время
     if block_fields['company'] is not None:
         company_para = doc.paragraphs[block_fields['company']]
         if company and company != 'Место работы / время':
-            replace_text_preserving_format(company_para, company_para.text, company)
+            replace_text_preserving_format(company_para, company_para.text, uppercase_duration_words(company))
     
     # 2. Роль
     if block_fields['role_label'] is not None:
         role_label_para = doc.paragraphs[block_fields['role_label']]
         # Убеждаемся, что метка "Роль:" есть
         if 'роль:' not in role_label_para.text.lower():
-            replace_text_preserving_format(role_label_para, role_label_para.text, "Роль:")
+            replace_text_preserving_format(role_label_para, role_label_para.text, "Роль:", force_default_font=False)
     
     if block_fields['role_value'] is not None:
         role_value_para = doc.paragraphs[block_fields['role_value']]
@@ -2101,62 +2570,45 @@ def fill_single_project_block(doc, block_fields, project_item):
             replace_text_preserving_format(role_value_para, role_value_para.text, role)
         else:
             replace_text_preserving_format(role_value_para, role_value_para.text, "")
+        ensure_runs_not_bold(role_value_para)
     
     # 3. Задачи
     if block_fields['tasks_label'] is not None:
         tasks_label_para = doc.paragraphs[block_fields['tasks_label']]
         # Убеждаемся, что метка "Задачи:" есть
         if 'задачи:' not in tasks_label_para.text.lower():
-            replace_text_preserving_format(tasks_label_para, tasks_label_para.text, "Задачи:")
+            replace_text_preserving_format(tasks_label_para, tasks_label_para.text, "Задачи:", force_default_font=False)
     
-    if tasks and tasks != ['Задачи']:
-        real_tasks = [t for t in tasks if t != 'Задачи' and t.strip()]
-        if real_tasks:
-            # Заполняем существующие поля задач
-            for task_idx, task in enumerate(real_tasks):
-                if task_idx < len(block_fields['tasks_fields']):
-                    # Используем существующее поле
-                    task_para = doc.paragraphs[block_fields['tasks_fields'][task_idx]]
-                    replace_text_preserving_format(task_para, task_para.text, f"• {task}")
-                else:
-                    # Создаем новое поле после последнего поля задач
-                    if block_fields['tasks_fields']:
-                        last_task_idx = block_fields['tasks_fields'][-1]
-                    elif block_fields['tasks_label'] is not None:
-                        last_task_idx = block_fields['tasks_label']
-                    else:
-                        last_task_idx = block_fields['role_value'] if block_fields['role_value'] else block_fields['company']
-                    
-                    new_task_para = doc.paragraphs[last_task_idx].insert_paragraph_after()
-                    if block_fields['tasks_label'] is not None:
-                        clone_paragraph_formatting(doc.paragraphs[block_fields['tasks_label']], new_task_para)
-                    new_task_para.add_run(f"• {task}")
-                    # Находим индекс нового параграфа
-                    for idx, para in enumerate(doc.paragraphs):
-                        if para == new_task_para:
-                            block_fields['tasks_fields'].append(idx)
-                            break
+    real_tasks = normalize_bullet_items(tasks, ['Задачи'])
+    if real_tasks:
+        if not set_bullet_list_in_document(doc, block_fields['tasks_fields'], real_tasks):
+            pass
+
+    real_achievements = normalize_bullet_items(achievements, ['Достижения'])
+    if real_achievements:
+        if not set_bullet_list_in_document(doc, block_fields['achievements_fields'], real_achievements):
+            pass
     
     # 4. Технологии и инструменты
     if block_fields['tech_label'] is not None:
         tech_label_para = doc.paragraphs[block_fields['tech_label']]
         # Убеждаемся, что метка есть
         if 'технологии' not in tech_label_para.text.lower():
-            replace_text_preserving_format(tech_label_para, tech_label_para.text, "Технологии и инструменты:")
+            replace_text_preserving_format(tech_label_para, tech_label_para.text, "Технологии и инструменты:", force_default_font=False)
     
     if block_fields['tech_value'] is not None:
         tech_value_para = doc.paragraphs[block_fields['tech_value']]
         if technologies and technologies != ['Технологии и инструменты']:
             real_tech = [t for t in technologies if t != 'Технологии и инструменты' and t.strip()]
             if real_tech:
-                # Если технологии уже в формате "Категория: технологии", используем как есть
-                # Иначе объединяем через запятую
-                tech_text = '\n'.join(real_tech) if any(':' in t for t in real_tech) else ', '.join(real_tech)
+                flat_tech = flatten_technology_entries(real_tech)
+                tech_text = ', '.join(flat_tech) if flat_tech else ', '.join(real_tech)
                 replace_text_preserving_format(tech_value_para, tech_value_para.text, tech_text)
             else:
                 replace_text_preserving_format(tech_value_para, tech_value_para.text, "")
         else:
             replace_text_preserving_format(tech_value_para, tech_value_para.text, "")
+        ensure_runs_not_bold(tech_value_para)
     
     return True
 
@@ -2180,11 +2632,16 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
     role = project_item.get('role', '').strip()
     tasks = project_item.get('tasks', [])
     technologies = project_item.get('technologies_and_tools', [])
+
+    # Новый формат: таблица с одним столбцом (по строке на каждое поле)
+    if all(len(row.cells) == 1 for row in table.rows):
+        return fill_single_column_project_table(table, project_item)
     
     # Отладочный вывод
     print(f"  📝 Заполнение блока: {company}")
     print(f"     Роль: '{role}' (поле найдено: {fields['role_value'] is not None})")
     print(f"     Задачи: {len(tasks) if tasks else 0} (полей найдено: {len(fields['tasks_fields'])})")
+    print(f"     Достижения: {len(achievements) if achievements else 0}")
     print(f"     Технологии: {len(technologies) if technologies else 0} (поле найдено: {fields['tech_value'] is not None})")
     
     # 1. Место работы / время
@@ -2195,9 +2652,13 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
             # Заменяем текст в ячейке
             if cell.paragraphs:
                 # Заменяем текст в первом параграфе
-                replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, company)
+                replace_text_preserving_format(
+                    cell.paragraphs[0],
+                    cell.paragraphs[0].text,
+                    uppercase_duration_words(company)
+                )
             else:
-                cell.add_paragraph(company)
+                cell.add_paragraph(uppercase_duration_words(company))
     
     # 2. Роль
     if fields['role_label'] is not None:
@@ -2207,7 +2668,7 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
         cell_text = ' '.join([p.text.strip() for p in cell.paragraphs]).lower()
         if 'роль:' not in cell_text:
             if cell.paragraphs:
-                replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, "Роль:")
+                replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, "Роль:", force_default_font=False)
     
     if fields['role_value'] is not None:
         # role_value может быть (row, cell) или (row, cell, para_index)
@@ -2221,10 +2682,12 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
                     replace_text_preserving_format(para, para.text, role)
                 else:
                     replace_text_preserving_format(para, para.text, "")
+                ensure_runs_not_bold(para)
             else:
                 if role and role != 'Роль:':
                     print(f"     ✓ Добавляю роль в ячейку ({row_idx}, {cell_idx})")
-                    cell.add_paragraph(role)
+                    new_para = cell.add_paragraph("")
+                    add_run_with_default_font(new_para, role)
         else:
             row_idx, cell_idx = fields['role_value']
             cell = table.rows[row_idx].cells[cell_idx]
@@ -2234,69 +2697,67 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
                     # Если ячейка пустая или содержит только пробелы, заменяем
                     current_text = cell.paragraphs[0].text.strip()
                     replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, role)
+                    ensure_runs_not_bold(cell.paragraphs[0])
                 else:
-                    cell.add_paragraph(role)
+                    new_para = cell.add_paragraph("")
+                    add_run_with_default_font(new_para, role)
             else:
                 if cell.paragraphs:
                     replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, "")
+                    ensure_runs_not_bold(cell.paragraphs[0])
     else:
         print(f"     ⚠️ Поле для роли не найдено!")
     
     # 3. Задачи
     if fields['tasks_label'] is not None:
         row_idx, cell_idx = fields['tasks_label']
-        cell = table.rows[row_idx].cells[cell_idx]
-        # Убеждаемся, что метка "Задачи:" есть
-        cell_text = ' '.join([p.text.strip() for p in cell.paragraphs]).lower()
+        label_cell = table.rows[row_idx].cells[cell_idx]
+        cell_text = ' '.join([p.text.strip() for p in label_cell.paragraphs]).lower()
         if 'задачи:' not in cell_text:
-            if cell.paragraphs:
-                replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, "Задачи:")
-        
-        if tasks and tasks != ['Задачи']:
-            real_tasks = [t for t in tasks if t != 'Задачи' and t.strip()]
-            if real_tasks:
-                print(f"     ✓ Найдено {len(real_tasks)} задач, доступно {len(fields['tasks_fields'])} полей")
-                
-                # Задачи просто пишутся в ячейку одной строкой
-                # Формируем текст со всеми задачами
-                tasks_text = '\n'.join([f"• {task}" for task in real_tasks])
-                
-                if fields['tasks_fields']:
-                    # Используем первое найденное поле для задач
-                    task_field = fields['tasks_fields'][0]
-                    if len(task_field) == 3:
-                        row_idx, cell_idx, para_idx = task_field
-                    else:
-                        row_idx, cell_idx = task_field
-                
-                print(f"     ✓ Заполняю задачи в ячейке ({row_idx}, {cell_idx})")
-                cell = table.rows[row_idx].cells[cell_idx]
-                
-                # Заменяем весь текст в ячейке задачами
-                if cell.paragraphs:
-                    # Заменяем первый параграф
-                    replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, tasks_text)
-                    # Удаляем остальные параграфы, если они есть
-                    for i in range(len(cell.paragraphs) - 1, 0, -1):
-                        p = cell.paragraphs[i]
-                        p.clear()
-                else:
-                    cell.add_paragraph(tasks_text)
+            if label_cell.paragraphs:
+                replace_text_preserving_format(label_cell.paragraphs[0], label_cell.paragraphs[0].text, "Задачи:", force_default_font=False)
+    real_tasks = normalize_bullet_items(tasks, ['Задачи'])
+    if real_tasks:
+        task_cell = None
+        if fields['tasks_fields']:
+            task_field = fields['tasks_fields'][0]
+            if len(task_field) == 3:
+                row_idx, cell_idx, _ = task_field
             else:
-                # Если поле не найдено, ищем ячейку рядом с "Задачи:"
-                if fields['tasks_label'] is not None:
-                    tasks_row, tasks_cell = fields['tasks_label']
-                    if tasks_cell + 1 < len(table.rows[tasks_row].cells):
-                        cell = table.rows[tasks_row].cells[tasks_cell + 1]
-                        print(f"     ✓ Заполняю задачи в ячейке ({tasks_row}, {tasks_cell + 1})")
-                        if cell.paragraphs:
-                            replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, tasks_text)
-                        else:
-                            cell.add_paragraph(tasks_text)
-                    else:
-                        print(f"     ⚠️ Не найдено ячейки для задач!")
-                else:
-                    print(f"     ⚠️ Не найдено поле для задач!")
+                row_idx, cell_idx = task_field
+            task_cell = table.rows[row_idx].cells[cell_idx]
+        elif fields['tasks_label'] is not None:
+            row_idx, cell_idx = fields['tasks_label']
+            if cell_idx + 1 < len(table.rows[row_idx].cells):
+                task_cell = table.rows[row_idx].cells[cell_idx + 1]
+        if task_cell is not None:
+            set_bullet_list_in_cell(task_cell, real_tasks)
+        else:
+            print(f"     ⚠️ Не найдено поле для задач!")
+
+    if fields.get('achievements_label') is not None:
+        row_idx, cell_idx = fields['achievements_label']
+        label_cell = table.rows[row_idx].cells[cell_idx]
+        cell_text = ' '.join([p.text.strip() for p in label_cell.paragraphs]).lower()
+        if 'достижения' not in cell_text:
+            if label_cell.paragraphs:
+                replace_text_preserving_format(label_cell.paragraphs[0], label_cell.paragraphs[0].text, "Достижения:", force_default_font=False)
+    real_achievements = normalize_bullet_items(achievements, ['Достижения'])
+    if real_achievements:
+        ach_cell = None
+        if fields.get('achievements_fields'):
+            ach_field = fields['achievements_fields'][0]
+            if len(ach_field) == 3:
+                row_idx, cell_idx, _ = ach_field
+            else:
+                row_idx, cell_idx = ach_field
+            ach_cell = table.rows[row_idx].cells[cell_idx]
+        elif fields.get('achievements_label') is not None:
+            row_idx, cell_idx = fields['achievements_label']
+            if cell_idx + 1 < len(table.rows[row_idx].cells):
+                ach_cell = table.rows[row_idx].cells[cell_idx + 1]
+        if ach_cell is not None:
+            set_bullet_list_in_cell(ach_cell, real_achievements)
     
     # 4. Технологии и инструменты
     if fields['tech_label'] is not None:
@@ -2309,7 +2770,6 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
                 replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, "Технологии и инструменты:")
     
     if fields['tech_value'] is not None:
-        # tech_value может быть (row, cell) или (row, cell, para_index)
         if len(fields['tech_value']) == 3:
             row_idx, cell_idx, para_idx = fields['tech_value']
             cell = table.rows[row_idx].cells[cell_idx]
@@ -2318,10 +2778,11 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
                 if technologies and technologies != ['Технологии и инструменты']:
                     real_tech = [t for t in technologies if t != 'Технологии и инструменты' and t.strip()]
                     if real_tech:
-                        # Если технологии уже в формате "Категория: технологии", используем как есть
-                        tech_text = '\n'.join(real_tech) if any(':' in t for t in real_tech) else ', '.join(real_tech)
+                        flat_tech = flatten_technology_entries(real_tech)
+                        tech_text = ', '.join(flat_tech) if flat_tech else ', '.join(real_tech)
                         print(f"     ✓ Заполняю технологии в ячейке ({row_idx}, {cell_idx}), параграф {para_idx}")
                         replace_text_preserving_format(para, para.text, tech_text)
+                        ensure_runs_not_bold(para)
                     else:
                         replace_text_preserving_format(para, para.text, "")
                 else:
@@ -2330,23 +2791,26 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
                 if technologies and technologies != ['Технологии и инструменты']:
                     real_tech = [t for t in technologies if t != 'Технологии и инструменты' and t.strip()]
                     if real_tech:
-                        # Если технологии уже в формате "Категория: технологии", используем как есть
-                        tech_text = '\n'.join(real_tech) if any(':' in t for t in real_tech) else ', '.join(real_tech)
+                        flat_tech = flatten_technology_entries(real_tech)
+                        tech_text = ', '.join(flat_tech) if flat_tech else ', '.join(real_tech)
                         print(f"     ✓ Добавляю технологии в ячейку ({row_idx}, {cell_idx})")
-                        cell.add_paragraph(tech_text)
+                        new_para = cell.add_paragraph("")
+                        add_run_with_default_font(new_para, tech_text)
         else:
             row_idx, cell_idx = fields['tech_value']
             cell = table.rows[row_idx].cells[cell_idx]
             if technologies and technologies != ['Технологии и инструменты']:
                 real_tech = [t for t in technologies if t != 'Технологии и инструменты' and t.strip()]
                 if real_tech:
-                    # Если технологии уже в формате "Категория: технологии", используем как есть
-                    tech_text = '\n'.join(real_tech) if any(':' in t for t in real_tech) else ', '.join(real_tech)
+                    flat_tech = flatten_technology_entries(real_tech)
+                    tech_text = ', '.join(flat_tech) if flat_tech else ', '.join(real_tech)
                     print(f"     ✓ Заполняю технологии в ячейке ({row_idx}, {cell_idx})")
                     if cell.paragraphs:
                         replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, tech_text)
+                        ensure_runs_not_bold(cell.paragraphs[0])
                     else:
-                        cell.add_paragraph(tech_text)
+                        new_para = cell.add_paragraph("")
+                        add_run_with_default_font(new_para, tech_text)
                 else:
                     if cell.paragraphs:
                         replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, "")
@@ -2356,6 +2820,70 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
     else:
         print(f"     ⚠️ Поле для технологий не найдено!")
     
+    return True
+
+
+def fill_single_column_project_table(table, project_item):
+    """Заполняет блок проекта в таблице с одним столбцом."""
+    def find_row(keyword):
+        keyword = keyword.lower()
+        for idx, row in enumerate(table.rows):
+            if not row.cells:
+                continue
+            cell_text = ' '.join(p.text.strip().lower() for p in row.cells[0].paragraphs)
+            if keyword in cell_text:
+                return idx
+        return None
+
+    def get_cell(row_idx):
+        if row_idx is None or row_idx >= len(table.rows):
+            return None
+        return table.rows[row_idx].cells[0] if table.rows[row_idx].cells else None
+
+    def set_label_value(cell, fallback_label, value):
+        if cell is None:
+            return False
+        if not cell.paragraphs:
+            cell.add_paragraph('')
+        first_para = cell.paragraphs[0]
+        for extra in cell.paragraphs[1:]:
+            extra._element.getparent().remove(extra._element)
+        text = first_para.text.strip()
+        colon_idx = text.find(':')
+        label_text = fallback_label
+        if colon_idx != -1:
+            label_text = text[:colon_idx + 1]
+        write_label_and_value(first_para, label_text, value.strip() if value else '')
+        return True
+
+    # Место работы / время
+    company_value = project_item.get('company', '').strip()
+    if company_value and company_value != 'Место работы / время':
+        company_value = uppercase_duration_words(company_value)
+        cell = get_cell(find_row('место работы'))
+        if cell and cell.paragraphs:
+            replace_text_preserving_format(cell.paragraphs[0], cell.paragraphs[0].text, company_value)
+
+    # Роль
+    role_value = project_item.get('role', '').strip()
+    set_label_value(get_cell(find_row('роль')), 'Роль:', role_value)
+
+    # Задачи
+    tasks_items = normalize_bullet_items(project_item.get('tasks', []), ['Задачи'])
+    set_labeled_bullet_list(get_cell(find_row('задачи')), 'Задачи:', tasks_items)
+
+    # Достижения
+    achievements_items = normalize_bullet_items(
+        project_item.get('achievements') or project_item.get('achievements_and_results', []),
+        ['Достижения']
+    )
+    set_labeled_bullet_list(get_cell(find_row('достижения')), 'Достижения:', achievements_items)
+
+    # Технологии и инструменты
+    tech_items = normalize_bullet_items(project_item.get('technologies_and_tools', []), ['Технологии и инструменты'])
+    tech_text = '; '.join(tech_items)
+    set_label_value(get_cell(find_row('технологии')), 'Технологии и инструменты:', tech_text)
+
     return True
 
 
@@ -2650,21 +3178,19 @@ def fill_project_experience_simple(doc, header_idx, real_projects):
         
         if company and company != 'Место работы / время':
             company_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-            company_para.add_run(company)
+            add_run_with_default_font(company_para, uppercase_duration_words(company))
             insert_idx += 1
         
         if insert_idx >= len(doc.paragraphs):
             doc.add_paragraph()
             insert_idx = len(doc.paragraphs) - 1
         
+        role_para = doc.paragraphs[insert_idx].insert_paragraph_before()
+        label_run = add_run_with_default_font(role_para, "Роль:")
+        label_run.bold = True
         if role and role != 'Роль:':
-            role_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-            role_para.add_run(f"Роль: {role}")
-            insert_idx += 1
-        else:
-            role_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-            role_para.add_run("Роль:")
-            insert_idx += 1
+            add_run_with_default_font(role_para, f" {role}")
+        insert_idx += 1
         
         if tasks and tasks != ['Задачи']:
             real_tasks = [t for t in tasks if t != 'Задачи' and t.strip()]
@@ -2674,7 +3200,8 @@ def fill_project_experience_simple(doc, header_idx, real_projects):
                         doc.add_paragraph()
                         insert_idx = len(doc.paragraphs) - 1
                     task_para = doc.paragraphs[insert_idx].insert_paragraph_before()
-                    task_para.add_run(f"• {task}")
+                    configure_bullet_paragraph(task_para)
+                    add_run_with_default_font(task_para, f"• {task}")
                     insert_idx += 1
         
         if insert_idx >= len(doc.paragraphs):
@@ -2694,10 +3221,10 @@ def fill_project_experience_simple(doc, header_idx, real_projects):
                 # Иначе добавляем общую категорию
                 if any(':' in t for t in real_tech):
                     tech_text = '\n'.join(real_tech)
-                    tech_para.add_run(tech_text)
+                    add_run_with_default_font(tech_para, tech_text)
                 else:
                     tech_text = ', '.join(real_tech)
-                    tech_para.add_run(f"Технологии и инструменты: {tech_text}")
+                    add_run_with_default_font(tech_para, f"Технологии и инструменты: {tech_text}")
                 insert_idx += 1
         
         if added_count < len(real_projects) - 1:
@@ -2771,4 +3298,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

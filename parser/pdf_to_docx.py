@@ -8,7 +8,253 @@
 import sys
 import os
 import argparse
+import asyncio
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator, List, Optional, Literal, AsyncIterator
+
+
+@dataclass
+class ConversionConfig:
+    """Параметры для конвертации резюме."""
+
+    input_file: str
+    input_kind: Literal["pdf", "docx"] = "pdf"
+    output_file: Optional[str] = None
+    md_path: Optional[str] = None
+    json_path: Optional[str] = None
+    json_template: str = "parser/template/example.json"
+    docx_template: str = "parser/template/example_cv_docx.docx"
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    keep_intermediate: bool = False
+    skip_step1: bool = False
+    skip_step2: bool = False
+    skip_step3: bool = False
+
+
+@dataclass
+class ConversionStage:
+    """Информация о завершенном этапе конвертации."""
+
+    name: str
+    status: str
+    path: Optional[str] = None
+    message: Optional[str] = None
+
+
+@dataclass
+class ConversionResult:
+    """Результат выполнения всей цепочки конвертации."""
+
+    input_file: str
+    output_file: Optional[str]
+    md_file: Optional[str]
+    json_file: Optional[str]
+    deleted_files: List[str]
+    kept_intermediate: bool
+
+
+class ResumeConverter:
+    """Запускает конвертацию и отслеживает промежуточные файлы."""
+
+    def __init__(self, config: ConversionConfig, verbose: bool = True):
+        self.config = config
+        self.verbose = verbose
+        self._input_path = Path(config.input_file)
+
+        if not self._input_path.exists():
+            raise FileNotFoundError(f"Файл '{config.input_file}' не найден.")
+        if config.input_kind not in ("pdf", "docx"):
+            raise ValueError("Поддерживаются только входные типы 'pdf' и 'docx'.")
+
+        self.md_path = config.md_path or str(self._input_path.with_suffix('.md'))
+        self.json_path = config.json_path or str(self._input_path.with_suffix('.json'))
+        default_docx = self._input_path.with_name(f"{self._input_path.stem}_filled.docx")
+        self.docx_path = config.output_file or str(default_docx)
+
+        self._created_files = {'md': False, 'json': False}
+        self._removed_files: List[str] = []
+        self.result: Optional[ConversionResult] = None
+
+    def run_iter(self) -> Iterator[ConversionStage]:
+        """Выполняет конвертацию и выдает этапы по мере завершения."""
+        try:
+            yield self._run_step1()
+            yield self._run_step2()
+            yield self._run_step3()
+            cleanup_stage = self._cleanup()
+            if cleanup_stage:
+                yield cleanup_stage
+
+            self.result = ConversionResult(
+                input_file=str(self._input_path),
+                output_file=None if self.config.skip_step3 else self.docx_path,
+                md_file=self.md_path,
+                json_file=self.json_path,
+                deleted_files=list(self._removed_files),
+                kept_intermediate=self.config.keep_intermediate
+            )
+        except Exception:
+            self._cleanup_on_error()
+            raise
+
+    def run(self) -> ConversionResult:
+        """Запускает конвертацию без промежуточных уведомлений."""
+        for _ in self.run_iter():
+            pass
+        if not self.result:
+            raise RuntimeError("Конвертация не вернула результат")
+        return self.result
+
+    async def run_iter_async(self) -> AsyncIterator[ConversionStage]:
+        """Асинхронно выполняет конвертацию, отдавая этапы по мере завершения."""
+        try:
+            stage = await asyncio.to_thread(self._run_step1)
+            yield stage
+
+            stage = await asyncio.to_thread(self._run_step2)
+            yield stage
+
+            stage = await asyncio.to_thread(self._run_step3)
+            yield stage
+
+            cleanup_stage = await asyncio.to_thread(self._cleanup)
+            if cleanup_stage:
+                yield cleanup_stage
+
+            self.result = ConversionResult(
+                input_file=str(self._input_path),
+                output_file=None if self.config.skip_step3 else self.docx_path,
+                md_file=self.md_path,
+                json_file=self.json_path,
+                deleted_files=list(self._removed_files),
+                kept_intermediate=self.config.keep_intermediate
+            )
+        except Exception:
+            await asyncio.to_thread(self._cleanup_on_error)
+            raise
+
+    async def run_async(self) -> ConversionResult:
+        """Асинхронно выполняет конвертацию без получения этапов."""
+        async for _ in self.run_iter_async():
+            pass
+        if not self.result:
+            raise RuntimeError("Конвертация не вернула результат")
+        return self.result
+
+    def _run_step1(self) -> ConversionStage:
+        cfg = self.config
+        if cfg.skip_step1:
+            if not self.md_path or not os.path.exists(self.md_path):
+                raise FileNotFoundError(
+                    f"Файл '{self.md_path}' не найден (--skip-step1 указан, но файл отсутствует)."
+                )
+            return ConversionStage(
+                name="step1",
+                status="skipped",
+                path=self.md_path,
+                message="Используется существующий Markdown файл"
+            )
+
+        if cfg.input_kind == "docx":
+            self.md_path = step1_docx_to_md(cfg.input_file, self.md_path, verbose=self.verbose)
+        else:
+            self.md_path = step1_pdf_to_md(cfg.input_file, self.md_path, verbose=self.verbose)
+        self._created_files['md'] = True
+        return ConversionStage(
+            name="step1",
+            status="completed",
+            path=self.md_path,
+            message="Markdown файл создан"
+        )
+
+    def _run_step2(self) -> ConversionStage:
+        cfg = self.config
+        if cfg.skip_step2:
+            if not self.json_path or not os.path.exists(self.json_path):
+                raise FileNotFoundError(
+                    f"Файл '{self.json_path}' не найден (--skip-step2 указан, но файл отсутствует)."
+                )
+            return ConversionStage(
+                name="step2",
+                status="skipped",
+                path=self.json_path,
+                message="Используется существующий JSON файл"
+            )
+
+        self.json_path = step2_md_to_json(
+            self.md_path,
+            self.json_path,
+            cfg.json_template,
+            cfg.api_key,
+            cfg.model,
+            verbose=self.verbose
+        )
+        self._created_files['json'] = True
+        return ConversionStage(
+            name="step2",
+            status="completed",
+            path=self.json_path,
+            message="JSON файл создан"
+        )
+
+    def _run_step3(self) -> ConversionStage:
+        cfg = self.config
+        if cfg.skip_step3:
+            return ConversionStage(
+                name="step3",
+                status="skipped",
+                message="Шаг 3 пропущен, Word файл не создается"
+            )
+
+        self.docx_path = step3_json_to_docx(
+            self.json_path,
+            self.docx_path,
+            cfg.docx_template,
+            verbose=self.verbose
+        )
+        return ConversionStage(
+            name="step3",
+            status="completed",
+            path=self.docx_path,
+            message="DOCX файл создан"
+        )
+
+    def _cleanup(self) -> Optional[ConversionStage]:
+        removed = self._remove_intermediate_files()
+        self._removed_files = removed
+        if removed:
+            return ConversionStage(
+                name="cleanup",
+                status="completed",
+                message="Удалены промежуточные файлы: " + ", ".join(removed)
+            )
+        return None
+
+    def _cleanup_on_error(self) -> None:
+        if self.config.keep_intermediate:
+            return
+        self._removed_files = self._remove_intermediate_files()
+
+    def _remove_intermediate_files(self) -> List[str]:
+        if self.config.keep_intermediate:
+            return []
+        removed = []
+        if self._created_files.get('md') and self.md_path and os.path.exists(self.md_path):
+            os.remove(self.md_path)
+            removed.append(self.md_path)
+        if self._created_files.get('json') and self.json_path and os.path.exists(self.json_path):
+            os.remove(self.json_path)
+            removed.append(self.json_path)
+        return removed
+
+
+def convert_resume(config: ConversionConfig, verbose: bool = True) -> ConversionResult:
+    """Запускает полную конвертацию и возвращает результат."""
+
+    converter = ResumeConverter(config, verbose=verbose)
+    return converter.run()
 
 # Функция для получения правильного пути к шаблону
 def get_template_path(template_path):
@@ -407,64 +653,57 @@ def main():
     print(f"Выходной файл: {docx_path}")
     print("="*60)
     
+    config = ConversionConfig(
+        input_file=args.pdf_file,
+        input_kind="pdf",
+        output_file=docx_path,
+        md_path=md_path,
+        json_path=json_path,
+        json_template=args.json_template,
+        docx_template=args.docx_template,
+        api_key=args.api_key,
+        model=args.model,
+        keep_intermediate=args.keep_intermediate,
+        skip_step1=args.skip_step1,
+        skip_step2=args.skip_step2,
+        skip_step3=args.skip_step3,
+    )
+
+    converter = ResumeConverter(config, verbose=True)
+
     try:
-        # Шаг 1: PDF -> MD
-        if not args.skip_step1:
-            md_path = step1_pdf_to_md(args.pdf_file, md_path, verbose=True)
-        else:
-            if not os.path.exists(md_path):
-                print(f"Ошибка: файл '{md_path}' не найден (--skip-step1 указан, но файл отсутствует).")
-                sys.exit(1)
-            print(f"\n⏭️  Пропущен шаг 1, используется существующий файл: {md_path}")
-        
-        # Шаг 2: MD -> JSON
-        if not args.skip_step2:
-            json_path = step2_md_to_json(
-                md_path,
-                json_path,
-                args.json_template,
-                args.api_key,
-                args.model,
-                verbose=True
-            )
-        else:
-            if not os.path.exists(json_path):
-                print(f"Ошибка: файл '{json_path}' не найден (--skip-step2 указан, но файл отсутствует).")
-                sys.exit(1)
-            print(f"\n⏭️  Пропущен шаг 2, используется существующий файл: {json_path}")
-        
-        # Шаг 3: JSON -> DOCX
-        if not args.skip_step3:
-            docx_path = step3_json_to_docx(
-                json_path,
-                docx_path,
-                args.docx_template,
-                verbose=True
-            )
-        else:
-            print(f"\n⏭️  Пропущен шаг 3")
-        
-        # Удаление промежуточных файлов, если не указано --keep-intermediate
-        if not args.keep_intermediate:
-            if not args.skip_step1 and os.path.exists(md_path):
-                os.remove(md_path)
-                print(f"\n🗑️  Удален промежуточный файл: {md_path}")
-            if not args.skip_step2 and os.path.exists(json_path):
-                os.remove(json_path)
-                print(f"🗑️  Удален промежуточный файл: {json_path}")
-        
+        for stage in converter.run_iter():
+            if stage.name == "cleanup" and stage.message:
+                print(f"\n🗑️  {stage.message}")
+            elif stage.status == "skipped":
+                if stage.name == "step1" and stage.path:
+                    print(f"\n⏭️  Пропущен шаг 1, используется существующий файл: {stage.path}")
+                elif stage.name == "step2" and stage.path:
+                    print(f"\n⏭️  Пропущен шаг 2, используется существующий файл: {stage.path}")
+                elif stage.name == "step3":
+                    print("\n⏭️  Пропущен шаг 3")
+
+        result = converter.result
+        if not result:
+            raise RuntimeError("Не удалось получить результат конвертации")
+
         print("\n" + "="*60)
-        print("✅ ПРЕОБРАЗОВАНИЕ ЗАВЕРШЕНО УСПЕШНО!")
-        print("="*60)
-        print(f"📄 Результат сохранен в: {docx_path}")
+        if result.output_file:
+            print("✅ ПРЕОБРАЗОВАНИЕ ЗАВЕРШЕНО УСПЕШНО!")
+            print("="*60)
+            print(f"📄 Результат сохранен в: {result.output_file}")
+        else:
+            print("ℹ️  Конвертация завершена без создания Word файла (шаг 3 пропущен)")
+            print("="*60)
+
         if args.keep_intermediate:
-            print(f"📝 Промежуточные файлы сохранены:")
-            if not args.skip_step1:
-                print(f"   - {md_path}")
-            if not args.skip_step2:
-                print(f"   - {json_path}")
+            print("📝 Промежуточные файлы сохранены:")
+            if not args.skip_step1 and result.md_file:
+                print(f"   - {result.md_file}")
+            if not args.skip_step2 and result.json_file:
+                print(f"   - {result.json_file}")
         print("="*60)
-        
+
     except KeyboardInterrupt:
         print("\n\n⚠️  Преобразование прервано пользователем.")
         sys.exit(1)
@@ -477,4 +716,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
