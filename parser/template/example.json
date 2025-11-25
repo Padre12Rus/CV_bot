@@ -1,53 +1,58 @@
 {
-    "full_name": "ФИО",
-    "vacancy": "Место для указания вакансии",
-    "project_background": "Разработка ПО, отрасль",
-    "pitch": "Рассказ о себе от первого лица",
-    "general_info": {
-      "skills_and_tools": [],
-      "education": [],
-      "foreign_language": "",
-      "citizenship_location": "",
-      "employment": "",
-      "status": ""
-    },
-    "screening": {
-      "hard_skills": [],
-      "soft_skills": []
-    },
-    "work_experience": [
-      {
-        "company": "",
-        "position": "",
-        "period": "",
-        "responsibilities": [],
-        "technologies": [],
-        "achievements": [],
-        "projects": [
-          {
-            "project_name": "",
-            "role": "",
-            "tasks": [],
-            "tools": [],
-            "achievements": []
-          }
-        ]
-      }
+  "full_name": "ФИО",
+  "vacancy": "Место для указания вакансии",
+  "project_background": "**Финтех, банки, ритейл**",
+  "pitch": "Рассказ о себе от первого лица",
+  "general_info": {
+    "skills_and_tools": [],
+    "education": [
+      "2015, Московский финансово-юридический университет (Московская финансово-юридическая академия), Москва\nФакультет бизнеса и информационных технологий, Программное обеспечение вычислительной техники и автоматизированных систем (инженер)"
     ],
-    "project_experience": [
-      {
-        "company": "Место работы / время",
-        "role": "Роль",
-        "tasks": [
-          "Задачи"
-        ],
-        "achievements": [
-          "Достижения"
-        ],
-        "technologies_and_tools": [
-          "Технологии и инструменты"
-        ]
-      }
-    ]
-  }
-  
+    "advanced_training": [
+      "2020 г., Управление по Agile: Scrum, Kanban, Lean — Нетология"
+    ],
+    "foreign_language": "",
+    "citizenship_location": "",
+    "employment": "",
+    "status": ""
+  },
+  "screening": {
+    "hard_skills": [],
+    "soft_skills": []
+  },
+  "work_experience": [
+    {
+      "company": "",
+      "position": "",
+      "period": "",
+      "responsibilities": [],
+      "technologies": [],
+      "achievements": [],
+      "projects": [
+        {
+          "project_name": "",
+          "role": "",
+          "tasks": [],
+          "tools": [],
+          "achievements": []
+        }
+      ]
+    }
+  ],
+  "project_experience": [
+    {
+      "company": "Место работы",
+      "period": "2024 июль - 2025 март",
+      "role": "Роль (обязательно)",
+      "tasks": [
+        "Задачи"
+      ],
+      "achievements": [
+        "Достижения"
+      ],
+      "technologies_and_tools": [
+        "Технологии, инструменты"
+      ]
+    }
+  ]
+}
