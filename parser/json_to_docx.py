@@ -285,7 +285,7 @@ def find_placeholder_runs(paragraph, placeholder):
     return indices
 
 
-def replace_text_preserving_format(paragraph, old_text, new_text, force_default_font=True):
+def replace_text_preserving_format(paragraph, old_text, new_text, force_default_font=True, force_bold=None):
     """
     Заменяет текст в параграфе, сохраняя форматирование.
     Использует простой подход: заменяет весь текст параграфа, сохраняя форматирование первого run.
@@ -356,6 +356,9 @@ def replace_text_preserving_format(paragraph, old_text, new_text, force_default_
         target_run.font.color.rgb = font_color_rgb
     if force_default_font and new_text:
         apply_default_font(target_run)
+    if force_bold is not None:
+        target_run.font.bold = force_bold
+        target_run.bold = force_bold
 
     return True
 
@@ -688,6 +691,7 @@ def process_simple_fields(doc, data):
     simple_fields = {
         'vacancy': data.get('vacancy', ''),
         'pitch': data.get('pitch', ''),
+        'project_background': data.get('project_background', ''),
     }
     general_info = data.get('general_info', {})
     simple_fields.update({
@@ -698,12 +702,20 @@ def process_simple_fields(doc, data):
     })
 
     replaced_count = 0
+    uppercase_fields = {'vacancy', 'project_background'}
     for field_name, field_value in simple_fields.items():
         placeholder = f"{{{{{field_name}}}}}"
         value_str = str(field_value) if field_value else ""
+        if field_name in uppercase_fields:
+            value_str = value_str.upper()
 
         for para in doc.paragraphs:
-            if placeholder in para.text and replace_text_preserving_format(para, placeholder, value_str):
+            if placeholder in para.text and replace_text_preserving_format(
+                para,
+                placeholder,
+                value_str,
+                force_bold=(field_name == 'vacancy')
+            ):
                 replaced_count += 1
                 print(f"  ✓ {field_name}: {value_str[:50] if value_str else '(пусто)'}")
 
@@ -711,7 +723,12 @@ def process_simple_fields(doc, data):
             for row in table.rows:
                 for cell in row.cells:
                     for para in cell.paragraphs:
-                        if placeholder in para.text and replace_text_preserving_format(para, placeholder, value_str):
+                        if placeholder in para.text and replace_text_preserving_format(
+                            para,
+                            placeholder,
+                            value_str,
+                            force_bold=(field_name == 'vacancy')
+                        ):
                             replaced_count += 1
                             print(f"  ✓ {field_name} (в таблице): {value_str[:50] if value_str else '(пусто)'}")
 
@@ -901,9 +918,16 @@ def process_project_experience(doc, data):
             template_text = template_para.text
             has_role_placeholder = "{{role}}" in template_text
             has_tech_placeholder = "{{technologies_and_tools}}" in template_text
+            company_value = project_item.get('company', '').strip()
+            period_value = project_item.get('period', '').strip()
+            company_display = company_value
+            if period_value:
+                company_display = f"{company_display}\n{period_value}"
+            company_display = uppercase_duration_words(company_display)
             replacements = {
-                '{{company}}': project_item.get('company', ''),
+                '{{company}}': company_display,
                 '{{role}}': project_item.get('role', ''),
+                '{{period}}': period_value,
             }
             for placeholder, value in replacements.items():
                 if placeholder in para_text:
@@ -1095,6 +1119,7 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
     Returns:
         bool: True если заполнение выполнено
     """
+    bold_needed = (field_name == 'vacancy')
     target_info = find_empty_paragraph_after_header(doc, header_keywords)
     if target_info is None:
         if debug:
@@ -1114,7 +1139,12 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
         if placeholder:
             if debug:
                 print(f"  🔄 Замена плейсхолдера '{placeholder.group()}' на '{value_str[:50]}'")
-            return replace_text_preserving_format(para, placeholder.group(), value_str)
+            return replace_text_preserving_format(
+                para,
+                placeholder.group(),
+                value_str,
+                force_bold=bold_needed
+            )
     
     # Иначе заменяем весь текст параграфа
     old_text = para.text.strip()
@@ -1155,12 +1185,18 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
                                 target_para = next_cell.add_paragraph("")
                 if target_para:
                     target_para.clear()
-                    add_run_with_default_font(target_para, value_str)
+                    run = add_run_with_default_font(target_para, value_str)
+                    if bold_needed:
+                        run.font.bold = True
+                        run.bold = True
                     if debug:
                         print(f"  ✅ Добавлен текст под заголовком в следующей строке: '{value_str[:50]}'")
                     return True
                 para.clear()
-                add_run_with_default_font(para, value_str)
+                run = add_run_with_default_font(para, value_str)
+                if bold_needed:
+                    run.font.bold = True
+                    run.bold = True
                 if debug:
                     print(f"  ✅ Заголовок заменен значением в той же ячейке: '{value_str[:50]}'")
                 return True
@@ -1176,7 +1212,10 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
             if target_para is None:
                 target_para = cell.add_paragraph("")
             target_para.clear()
-            add_run_with_default_font(target_para, value_str)
+            run = add_run_with_default_font(target_para, value_str)
+            if bold_needed:
+                run.font.bold = True
+                run.bold = True
             if debug:
                 print(f"  ✅ Добавлен текст в новую строку ячейки: '{value_str[:50]}'")
             return True
@@ -1202,12 +1241,20 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
                 if not is_other_header:
                     if next_text in placeholder_texts or '{{' in next_text:
                         next_para.clear()
-                        add_run_with_default_font(next_para, value_str)
+                        run = add_run_with_default_font(next_para, value_str)
+                        if bold_needed:
+                            run.font.bold = True
+                            run.bold = True
                         if debug:
                             print(f"  ✅ Заполнен следующий параграф: '{value_str[:50]}'")
                         return True
                     else:
-                        replace_text_preserving_format(next_para, next_text, value_str)
+                        replace_text_preserving_format(
+                            next_para,
+                            next_text,
+                            value_str,
+                            force_bold=bold_needed
+                        )
                         if debug:
                             print(f"  ✅ Заменен текст в следующем параграфе: '{value_str[:50]}'")
                         return True
@@ -1218,7 +1265,10 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
     if old_text in ['Место для указания вакансии', '—', '-', '']:
         # Очищаем параграф и добавляем новый текст
         para.clear()
-        add_run_with_default_font(para, value_str)
+        run = add_run_with_default_font(para, value_str)
+        if bold_needed:
+            run.font.bold = True
+            run.bold = True
         if debug:
             print(f"  ✅ Заполнен пустой параграф: '{value_str[:50]}'")
         return True
@@ -1226,11 +1276,19 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
     if old_text:
         if debug:
             print(f"  🔄 Замена текста '{old_text[:50]}' на '{value_str[:50]}'")
-        result = replace_text_preserving_format(para, old_text, value_str)
+        result = replace_text_preserving_format(
+            para,
+            old_text,
+            value_str,
+            force_bold=bold_needed
+        )
         if not result:
             # Если замена не удалась, просто очищаем и добавляем новый текст
             para.clear()
-            add_run_with_default_font(para, value_str)
+            run = add_run_with_default_font(para, value_str)
+            if bold_needed:
+                run.font.bold = True
+                run.bold = True
             if debug:
                 print(f"  ✅ Заменено через очистку: '{value_str[:50]}'")
             return True
@@ -1240,8 +1298,14 @@ def fill_by_header(doc, header_keywords, value, field_name, debug=False):
         if para.runs:
             para.runs[0].text = value_str
             apply_default_font(para.runs[0])
+            if bold_needed:
+                para.runs[0].font.bold = True
+                para.runs[0].bold = True
         else:
-            add_run_with_default_font(para, value_str)
+            run = add_run_with_default_font(para, value_str)
+            if bold_needed:
+                run.font.bold = True
+                run.bold = True
         if debug:
             print(f"  ✅ Добавлен текст в пустой параграф: '{value_str[:50]}'")
         return True
@@ -1303,6 +1367,7 @@ def fill_document(template_path, json_data, output_path):
         replaced_lists = 0
         replaced_lists += process_list_field(doc, json_data, ['general_info', 'skills_and_tools'], 'skills_and_tools')
         replaced_lists += process_list_field(doc, json_data, ['general_info', 'education'], 'education')
+        replaced_lists += process_list_field(doc, json_data, ['general_info', 'advanced_training'], 'advanced_training')
         replaced_lists += process_list_field(doc, json_data, ['screening', 'hard_skills'], 'hard_skills')
         replaced_lists += process_list_field(doc, json_data, ['screening', 'soft_skills'], 'soft_skills')
         print(f"  Заполнено списков: {replaced_lists}")
@@ -1401,7 +1466,7 @@ def fill_by_headers_mode(doc, json_data, debug=False):
         or general_info.get('project_background')
     )
     if project_background:
-        if fill_label_paragraph(doc, 'ПРОЕКТНЫЙ БЭКГРАУНД', project_background, uppercase_value=False):
+        if fill_label_paragraph(doc, 'ПРОЕКТНЫЙ БЭКГРАУНД', project_background, uppercase_value=True):
             replaced_count += 1
             print(f"  ✓ Проектный бекграунд")
     
@@ -1447,6 +1512,19 @@ def fill_by_headers_mode(doc, json_data, debug=False):
         if fill_list_by_header(doc, ['образование', 'education'], education, 'education', use_bullets=False):
             replaced_count += 1
             print(f"  ✓ Образование: {len(education)} элементов")
+    
+    # Курсы повышения квалификации
+    advanced_training = general_info.get('advanced_training', [])
+    if advanced_training:
+        if fill_list_by_header(
+            doc,
+            ['курсы повышения квалификации', 'курсы повышения', 'повышение квалификации', 'advanced training', 'advanced_training'],
+            advanced_training,
+            'advanced_training',
+            debug=debug
+        ):
+            replaced_count += 1
+            print(f"  ✓ Курсы повышения квалификации: {len(advanced_training)} элементов")
     
     # Иностранный язык
     if general_info.get('foreign_language'):
@@ -1521,7 +1599,8 @@ def fill_by_headers_mode(doc, json_data, debug=False):
             for project in projects:
                 # Преобразуем формат проекта из work_experience в формат project_experience
                 project_data = {
-                    'company': f"{work_item.get('company', '')} / {work_item.get('period', '')}",
+                    'company': work_item.get('company', ''),
+                    'period': work_item.get('period', ''),
                     'role': project.get('role', work_item.get('position', '')),
                     'tasks': project.get('tasks', []),
                     'technologies_and_tools': project.get('tools', project.get('technologies_and_tools', [])),
@@ -1532,7 +1611,8 @@ def fill_by_headers_mode(doc, json_data, debug=False):
             # Если проектов нет, создаем проект из данных работы
             if work_item.get('company') or work_item.get('position'):
                 project_data = {
-                    'company': f"{work_item.get('company', '')} / {work_item.get('period', '')}",
+                    'company': work_item.get('company', ''),
+                    'period': work_item.get('period', ''),
                     'role': work_item.get('position', ''),
                     'tasks': work_item.get('responsibilities', []),
                     'technologies_and_tools': work_item.get('technologies', []),
@@ -2546,6 +2626,7 @@ def fill_single_project_block(doc, block_fields, project_item):
         bool: True если блок заполнен успешно
     """
     company = project_item.get('company', '').strip()
+    period = project_item.get('period', '').strip()
     role = project_item.get('role', '').strip()
     tasks = project_item.get('tasks', [])
     achievements = project_item.get('achievements') or project_item.get('achievements_and_results', [])
@@ -2555,7 +2636,10 @@ def fill_single_project_block(doc, block_fields, project_item):
     if block_fields['company'] is not None:
         company_para = doc.paragraphs[block_fields['company']]
         if company and company != 'Место работы / время':
-            replace_text_preserving_format(company_para, company_para.text, uppercase_duration_words(company))
+            company_display = company
+            if period:
+                company_display = f"{company_display}\n{period}"
+            replace_text_preserving_format(company_para, company_para.text, uppercase_duration_words(company_display))
     
     # 2. Роль
     if block_fields['role_label'] is not None:
@@ -2629,8 +2713,10 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
     fields = block_info['fields']
     
     company = project_item.get('company', '').strip()
+    period = project_item.get('period', '').strip()
     role = project_item.get('role', '').strip()
     tasks = project_item.get('tasks', [])
+    achievements = project_item.get('achievements') or project_item.get('achievements_and_results', [])
     technologies = project_item.get('technologies_and_tools', [])
 
     # Новый формат: таблица с одним столбцом (по строке на каждое поле)
@@ -2649,16 +2735,20 @@ def fill_single_project_block_in_table(doc, block_info, project_item):
         row_idx, cell_idx = fields['company']
         cell = table.rows[row_idx].cells[cell_idx]
         if company and company != 'Место работы / время':
+            company_display = company
+            if period:
+                company_display = f"{company_display}\n{period}"
+            company_display = uppercase_duration_words(company_display)
             # Заменяем текст в ячейке
             if cell.paragraphs:
                 # Заменяем текст в первом параграфе
                 replace_text_preserving_format(
                     cell.paragraphs[0],
                     cell.paragraphs[0].text,
-                    uppercase_duration_words(company)
+                    company_display
                 )
             else:
-                cell.add_paragraph(uppercase_duration_words(company))
+                cell.add_paragraph(company_display)
     
     # 2. Роль
     if fields['role_label'] is not None:
@@ -2858,7 +2948,10 @@ def fill_single_column_project_table(table, project_item):
 
     # Место работы / время
     company_value = project_item.get('company', '').strip()
+    period_value = project_item.get('period', '').strip()
     if company_value and company_value != 'Место работы / время':
+        if period_value:
+            company_value = f"{company_value}\n{period_value}"
         company_value = uppercase_duration_words(company_value)
         cell = get_cell(find_row('место работы'))
         if cell and cell.paragraphs:
