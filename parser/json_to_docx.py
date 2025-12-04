@@ -483,7 +483,8 @@ def calculate_experience_months(work_experience):
             continue
         if not end_date:
             end_date = date.today()
-        months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+        # +1 чтобы засчитывать стартовый месяц (Янв–Янв = 1 месяц)
+        months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month) + 1
         if months < 0:
             continue
         total_months += max(months, 0)
@@ -515,6 +516,46 @@ def format_experience_summary(work_experience):
             month_word = 'МЕСЯЦЕВ'
         parts.append(f"{months} {month_word}")
     return ' '.join(parts) if parts else "МЕНЕЕ 1 МЕСЯЦА"
+
+
+def fill_experience_summary(doc, json_data):
+    """Заполняет поле общего стажа (по плейсхолдерам и по заголовку)."""
+    provided = json_data.get('experience_total') or ""
+    provided = str(provided).strip()
+
+    if provided:
+        summary = provided
+    else:
+        work_experience = json_data.get('work_experience', []) or []
+        # Перед расчетом стажа сортируем записи, чтобы дата окончания была ближе к текущей
+        try:
+            work_experience = sort_work_experience_by_date(work_experience)
+        except Exception:
+            pass
+        summary = format_experience_summary(work_experience)
+
+    if not summary:
+        return 0
+
+    replaced = 0
+    placeholders = ['{{experience_summary}}', '{{experience}}', '{{work_experience_total}}']
+
+    for placeholder in placeholders:
+        for para in doc.paragraphs:
+            if placeholder in para.text and replace_text_preserving_format(para, placeholder, summary):
+                replaced += 1
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        if placeholder in para.text and replace_text_preserving_format(para, placeholder, summary):
+                            replaced += 1
+
+    # Заполняем заголовок/метку, если нет плейсхолдера
+    if fill_label_paragraph(doc, 'ОПЫТ РАБОТЫ', summary, uppercase_value=True):
+        replaced += 1
+
+    return replaced
 
 
 def fill_label_paragraph(doc, label_variants, value, uppercase_value=False):
@@ -882,6 +923,9 @@ def process_work_experience(doc, data):
 def process_project_experience(doc, data):
     """Обрабатывает блок проектного опыта."""
     project_experience = data.get('project_experience', [])
+    if project_experience:
+        project_experience = sort_projects_by_date(project_experience)
+        data['project_experience'] = project_experience
     if not project_experience:
         return 0
 
@@ -1363,13 +1407,15 @@ def fill_document(template_path, json_data, output_path):
         replaced_simple = process_simple_fields(doc, json_data)
         print(f"  Заполнено простых полей: {replaced_simple}")
 
+        print("\nЗаполнение общего стажа...")
+        summary_filled = fill_experience_summary(doc, json_data)
+        print(f"  Заполнено поле опыта работы: {summary_filled}")
+
         print("\nЗаполнение списков...")
         replaced_lists = 0
         replaced_lists += process_list_field(doc, json_data, ['general_info', 'skills_and_tools'], 'skills_and_tools')
         replaced_lists += process_list_field(doc, json_data, ['general_info', 'education'], 'education')
         replaced_lists += process_list_field(doc, json_data, ['general_info', 'advanced_training'], 'advanced_training')
-        replaced_lists += process_list_field(doc, json_data, ['screening', 'hard_skills'], 'hard_skills')
-        replaced_lists += process_list_field(doc, json_data, ['screening', 'soft_skills'], 'soft_skills')
         print(f"  Заполнено списков: {replaced_lists}")
 
         print("\nЗаполнение опыта работы...")
@@ -1428,6 +1474,10 @@ def fill_by_headers_mode(doc, json_data, debug=False):
     """
     replaced_count = 0
     work_experience = json_data.get('work_experience', [])
+    # Сразу приводим опыт работы к хронологическому порядку (от новых к старым)
+    if work_experience:
+        work_experience = sort_work_experience_by_date(work_experience)
+        json_data['work_experience'] = work_experience
     general_info = json_data.get('general_info', {})
     
     # ФИО - простая замена текста "ФИО" на значение из JSON
@@ -1552,34 +1602,7 @@ def fill_by_headers_mode(doc, json_data, debug=False):
             replaced_count += 1
             print(f"  ✓ Статус: {general_info['status']}")
     
-    # Скрининг
-    screening = json_data.get('screening', {})
-    
-    # Hard skills
-    hard_skills = screening.get('hard_skills', [])
-    if hard_skills:
-        if fill_list_by_header(doc, ['hard skills', 'hard_skills', 'hard'], hard_skills, 'hard_skills', debug=debug):
-            replaced_count += 1
-            print(f"  ✓ Hard skills: {len(hard_skills)} элементов")
-    
-    # Soft skills
-    soft_skills = screening.get('soft_skills', [])
-    if soft_skills:
-        # Пробуем разные варианты поиска заголовка
-        soft_keywords = [
-            ['soft skills', 'soft_skills', 'soft'],  # Оригинальные
-            ['soft skills:', 'soft_skills:', 'soft:'],  # С двоеточием
-            ['soft skills 	', 'soft_skills 	'],  # С табуляцией (для таблиц)
-        ]
-        found = False
-        for keywords in soft_keywords:
-            if fill_list_by_header(doc, keywords, soft_skills, 'soft_skills', debug=debug):
-                replaced_count += 1
-                print(f"  ✓ Soft skills: {len(soft_skills)} элементов")
-                found = True
-                break
-        if not found and debug:
-            print(f"  ⚠️  Не найден заголовок для списка 'soft_skills'")
+    # Скрининг — временно отключен
     
     # Опыт работы
     if work_experience:
@@ -2284,6 +2307,40 @@ def find_all_project_blocks_in_tables(doc, header_idx):
     return blocks
 
 
+def _get_project_block_row_range(fields):
+    """
+    Вспомогательная функция: определяет диапазон строк таблицы,
+    относящихся к одному блоку проекта, на основе найденных полей.
+    
+    Returns:
+        (start_row, end_row_exclusive)
+    """
+    row_indices = []
+    
+    def _add_row_idx(value):
+        if isinstance(value, tuple) and len(value) >= 2:
+            row_indices.append(value[0])
+    
+    _add_row_idx(fields.get('company'))
+    _add_row_idx(fields.get('role_label'))
+    _add_row_idx(fields.get('role_value'))
+    _add_row_idx(fields.get('tasks_label'))
+    _add_row_idx(fields.get('tech_label'))
+    _add_row_idx(fields.get('tech_value'))
+    
+    for item in fields.get('tasks_fields') or []:
+        _add_row_idx(item)
+    for item in fields.get('achievements_fields') or []:
+        _add_row_idx(item)
+    
+    if not row_indices:
+        return (0, 0)
+    
+    start_row = min(row_indices)
+    end_row = max(row_indices) + 1
+    return (start_row, end_row)
+
+
 def find_project_block_fields_in_table_row(table, start_row_idx):
     """
     Находит поля блока проекта в строке таблицы и следующих строках.
@@ -2628,9 +2685,25 @@ def fill_single_project_block(doc, block_fields, project_item):
     company = project_item.get('company', '').strip()
     period = project_item.get('period', '').strip()
     role = project_item.get('role', '').strip()
-    tasks = project_item.get('tasks', [])
-    achievements = project_item.get('achievements') or project_item.get('achievements_and_results', [])
-    technologies = project_item.get('technologies_and_tools', [])
+    tasks = project_item.get('tasks', []) or []
+    achievements = project_item.get('achievements') or project_item.get('achievements_and_results', []) or []
+    technologies = project_item.get('technologies_and_tools', []) or []
+
+    # Нормализация и компактное представление:
+    # 1) убираем дубликаты между задачами и достижениями (один и тот же текст не дублируем);
+    # 2) при необходимости ограничиваем количество пунктов, чтобы блоки не "раздувались" на полстраницы.
+    tasks_norm = [t.strip() for t in tasks if t and t.strip()]
+    achievements_norm = [a.strip() for a in achievements if a and a.strip()]
+
+    # Удаляем из достижений те пункты, которые дословно совпадают с задачами
+    tasks_set = set(tasks_norm)
+    achievements_unique = [a for a in achievements_norm if a not in tasks_set]
+
+    # Ограничение длины списков (можно при необходимости отрегулировать)
+    MAX_TASKS = 10
+    MAX_ACHIEVEMENTS = 8
+    tasks = tasks_norm[:MAX_TASKS]
+    achievements = achievements_unique[:MAX_ACHIEVEMENTS]
         
     # 1. Место работы / время
     if block_fields['company'] is not None:
@@ -3024,6 +3097,26 @@ def parse_date_from_period(period_str):
     return (0, 0)
 
 
+def sort_work_experience_by_date(work_experience):
+    """
+    Сортирует записи опыта работы по дате начала (от новых к старым).
+    
+    Args:
+        work_experience (list): Список элементов work_experience из JSON
+        
+    Returns:
+        list: Отсортированный список
+    """
+    def get_sort_key(item):
+        period = item.get('period', '') or ''
+        year, month = parse_date_from_period(period)
+        # отрицательные значения для сортировки по убыванию;
+        # элементы без даты отправляем в конец
+        return (-year if year > 0 else 9999, -month if month > 0 else 0)
+    
+    return sorted(work_experience or [], key=get_sort_key)
+
+
 def sort_projects_by_date(projects):
     """
     Сортирует проекты по дате начала (от новых к старым).
@@ -3207,11 +3300,60 @@ def fill_project_experience_by_header(doc, project_experience):
             else:
                 template_para_texts.append("")
     
+    # Если в шаблоне только один ПАРАГРАФНЫЙ блок, а проектов больше одного,
+    # используем простой режим вставки списка проектов (для таблиц будет свой режим клонирования).
+    if first_block.get('type') != 'table' and len(existing_blocks) == 1 and len(real_projects) > 1:
+        print(
+            f"  ℹ️ В шаблоне найден один текстовый блок проектного опыта, "
+            f"а проектов {len(real_projects)}. Используем простой режим вставки."
+        )
+        return fill_project_experience_simple(doc, actual_header_idx, real_projects)
+
+    def _delete_project_blocks(blocks_to_delete):
+        """Удаляет переданные блоки проектов (табличные и текстовые)."""
+        for block in reversed(blocks_to_delete):
+            if block.get('type') == 'table':
+                table_idx = block.get('table_idx')
+                if table_idx is None or table_idx >= len(doc.tables):
+                    continue
+                table = doc.tables[table_idx]
+                start_row, end_row = _get_project_block_row_range(block.get('fields', {}))
+                if end_row <= start_row or end_row > len(table.rows):
+                    start_row = block.get('row_idx', start_row if start_row is not None else 0)
+                    if start_row is None:
+                        continue
+                    end_row = start_row + 1
+                for row_idx in range(min(end_row, len(table.rows)) - 1, start_row - 1, -1):
+                    tbl = table._tbl
+                    tr = table.rows[row_idx]._tr
+                    tbl.remove(tr)
+            else:
+                start_idx = block.get('start_idx')
+                end_idx = block.get('end_idx')
+                if start_idx is None or end_idx is None:
+                    continue
+                for i in range(min(end_idx, len(doc.paragraphs)) - 1, start_idx - 1, -1):
+                    if 0 <= i < len(doc.paragraphs):
+                        doc.paragraphs[i]._element.getparent().remove(doc.paragraphs[i]._element)
+
+    # Если нет реальных проектов, удаляем все шаблонные блоки и выходим
+    if not real_projects:
+        if existing_blocks:
+            print("  ℹ️ Данных по проектам нет. Удаляем шаблонные блоки.")
+            _delete_project_blocks(existing_blocks)
+        return 0
+
+    # Если блоков больше, чем проектов, убираем лишние заранее (плейсхолдеры ещё на месте)
+    if len(existing_blocks) > len(real_projects):
+        print(f"  ℹ️ Блоков проектов в шаблоне больше, чем данных ({len(existing_blocks)} > {len(real_projects)}). "
+              f"Удаляем лишние блоки перед заполнением.")
+        _delete_project_blocks(existing_blocks[len(real_projects):])
+        existing_blocks = existing_blocks[:len(real_projects)]
+
     # Заполняем существующие блоки
     filled_count = 0
     for block_idx, block in enumerate(existing_blocks):
         if block_idx < len(real_projects):
-            # Заполняем блок данными проекта
             project_item = real_projects[block_idx]
             if block.get('type') == 'table':
                 fill_single_project_block_in_table(doc, block, project_item)
@@ -3221,12 +3363,6 @@ def fill_project_experience_by_header(doc, project_experience):
             company = project_item.get('company', 'Не указано')
             role = project_item.get('role', 'Не указано')
             print(f"  ✓ Проект {block_idx + 1}: {company} - {role}")
-    
-    # Если проектов больше чем блоков, создаем новые блоки
-    if len(real_projects) > len(existing_blocks):
-        print(f"  ⚠️  Проектов ({len(real_projects)}) больше чем блоков ({len(existing_blocks)})")
-        print(f"     Создание новых блоков пока не поддерживается для таблиц")
-        # TODO: Реализовать клонирование блоков в таблицах
     
     return filled_count
 

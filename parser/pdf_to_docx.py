@@ -31,6 +31,10 @@ class ConversionConfig:
     skip_step1: bool = False
     skip_step2: bool = False
     skip_step3: bool = False
+    # Новый режим: прямой проход файла через Gemini (без промежуточного MD)
+    use_direct_file_mode: bool = False
+    # Дополнительные пожелания пользователя к модели
+    user_hint: Optional[str] = None
 
 
 @dataclass
@@ -145,6 +149,16 @@ class ResumeConverter:
 
     def _run_step1(self) -> ConversionStage:
         cfg = self.config
+        # В прямом файловом режиме шаг 1 (PDF/DOCX -> MD) не нужен вообще
+        if getattr(cfg, "use_direct_file_mode", False):
+            # Не трогаем md_path, не создаём промежуточные файлы
+            return ConversionStage(
+                name="step1",
+                status="skipped",
+                path=str(self._input_path),
+                message="Шаг 1 пропущен: используется прямой режим обработки файла через Gemini"
+            )
+
         if cfg.skip_step1:
             if not self.md_path or not os.path.exists(self.md_path):
                 raise FileNotFoundError(
@@ -182,15 +196,30 @@ class ResumeConverter:
                 path=self.json_path,
                 message="Используется существующий JSON файл"
             )
-
-        self.json_path = step2_md_to_json(
-            self.md_path,
-            self.json_path,
-            cfg.json_template,
-            cfg.api_key,
-            cfg.model,
-            verbose=self.verbose
-        )
+        
+        # Новый режим: прямое использование файла без промежуточного Markdown
+        if cfg.use_direct_file_mode:
+            self.json_path = step2_file_to_json(
+                input_file=str(self._input_path),
+                input_kind=cfg.input_kind,
+                json_path=self.json_path,
+                json_template=cfg.json_template,
+                api_key=cfg.api_key,
+                model=cfg.model,
+                verbose=self.verbose,
+                user_hint=cfg.user_hint,
+            )
+        else:
+            # Старый режим: через промежуточный MD-файл
+            self.json_path = step2_md_to_json(
+                self.md_path,
+                self.json_path,
+                cfg.json_template,
+                cfg.api_key,
+                cfg.model,
+                verbose=self.verbose,
+                user_hint=cfg.user_hint,
+            )
         self._created_files['json'] = True
         return ConversionStage(
             name="step2",
@@ -306,10 +335,12 @@ try:
         read_file as read_md_file,
         load_json_template,
         process_with_gemini,
+        create_extraction_prompt,
+        create_extraction_prompt_for_file,
         merge_with_template,
         save_json,
         get_api_key,
-        DEFAULT_GEMINI_MODEL
+        DEFAULT_GEMINI_MODEL,
     )
 except ImportError:
     try:
@@ -317,13 +348,34 @@ except ImportError:
             read_file as read_md_file,
             load_json_template,
             process_with_gemini,
+            create_extraction_prompt,
+            create_extraction_prompt_for_file,
             merge_with_template,
             save_json,
             get_api_key,
-            DEFAULT_GEMINI_MODEL
+            DEFAULT_GEMINI_MODEL,
         )
     except ImportError:
         print("Ошибка: не удалось импортировать функции из md_to_json")
+        sys.exit(1)
+
+try:
+    from .ai_provider import (
+        AIProviderError,
+        process_file_with_gemini,
+        process_with_fallback,
+        get_api_keys,
+    )
+except ImportError:
+    try:
+        from ai_provider import (
+            AIProviderError,
+            process_file_with_gemini,
+            process_with_fallback,
+            get_api_keys,
+        )
+    except ImportError:
+        print("Ошибка: не удалось импортировать функции из ai_provider")
         sys.exit(1)
 
 try:
@@ -421,7 +473,7 @@ def step1_docx_to_md(docx_path, md_path=None, verbose=True):
 
 
 def step2_md_to_json(md_path, json_path=None, json_template="parser/template/example.json", 
-                     api_key=None, model=None, verbose=True):
+                     api_key=None, model=None, verbose=True, user_hint=None):
     """
     Шаг 2: Преобразование Markdown в JSON.
     
@@ -488,7 +540,8 @@ def step2_md_to_json(md_path, json_path=None, json_template="parser/template/exa
         markdown_content,
         json_template_data,
         api_key,
-        model
+        model,
+        user_hint=user_hint,
     )
     
     # Объединение с шаблоном
@@ -499,6 +552,121 @@ def step2_md_to_json(md_path, json_path=None, json_template="parser/template/exa
     
     if verbose:
         print(f"✅ Шаг 2 завершен: {json_path}")
+        print(f"\n📊 Статистика извлеченных данных:")
+        print(f"  - Опыт работы: {len(final_data.get('work_experience', []))} записей")
+        print(f"  - Проекты: {len(final_data.get('project_experience', []))} записей")
+        skills_count = len(final_data.get('general_info', {}).get('skills_and_tools', []))
+        print(f"  - Навыки: {skills_count} записей")
+    
+    return str(json_path)
+
+
+def step2_file_to_json(
+    input_file,
+    input_kind="pdf",
+    json_path=None,
+    json_template="parser/template/example.json",
+    api_key=None,
+    model=None,
+    verbose=True,
+    user_hint=None,
+):
+    """
+    Альтернативный шаг 2: прямое преобразование файла (PDF/DOCX) в JSON через Gemini.
+    При ошибке или отсутствии Gemini — fallback на текстовый режим (Gemini/OpenRouter).
+    """
+    if verbose:
+        print("\n" + "=" * 60)
+        print("ШАГ 2 (direct): Преобразование файла -> JSON (Gemini)")
+        print("=" * 60)
+    
+    # Получение правильного пути к шаблону
+    json_template = get_template_path(json_template)
+    
+    # Проверка шаблона
+    if not os.path.exists(json_template):
+        msg = f"Ошибка: шаблон '{json_template}' не найден."
+        print(msg)
+        raise FileNotFoundError(msg)
+    
+    # Определение пути к выходному файлу
+    if not json_path:
+        in_file = Path(input_file)
+        json_path = in_file.with_suffix('.json')
+    
+    if verbose:
+        print(f"Входной файл: {input_file} ({input_kind})")
+        print(f"Шаблон: {json_template}")
+        print(f"Выходной файл: {json_path}")
+    
+    # Загрузка шаблона
+    if verbose:
+        print(f"Загрузка шаблона: {json_template}")
+    json_template_data = load_json_template(json_template)
+    
+    # Получаем ключи из окружения / .env
+    env_keys = get_api_keys()
+    gemini_key = api_key or env_keys.get("gemini")
+    openrouter_key = env_keys.get("openrouter")
+    
+    final_data = None
+    
+    # 1. Прямая попытка: Gemini + файл
+    if gemini_key:
+        try:
+            if verbose:
+                print("Попытка прямой обработки файла через Gemini (без MD)...")
+            final_data = process_file_with_gemini(
+                file_path=input_file,
+                json_template=json_template_data,
+                prompt_creator_func=create_extraction_prompt_for_file,
+                gemini_api_key=gemini_key,
+                gemini_model=model,
+                verbose=verbose,
+                user_hint=user_hint,
+            )
+        except AIProviderError as e:
+            if verbose:
+                print(f"⚠️  Ошибка прямой обработки файла через Gemini: {e}")
+                print("    Переход к текстовому режиму (fallback)...")
+    
+    # 2. Fallback: извлекаем текст и используем общий провайдер (Gemini/OpenRouter)
+    if final_data is None:
+        if verbose:
+            print("Извлечение текста из файла для текстового режима...")
+        if input_kind == "docx":
+            text_content = extract_text_from_docx(input_file)
+        else:
+            text_content = extract_text_from_pdf(input_file)
+        
+        if not text_content.strip():
+            print("⚠️  Предупреждение: не удалось извлечь текст из файла для fallback-режима.")
+        
+        if verbose:
+            print("Обработка через AI-провайдер (Gemini/OpenRouter) в текстовом режиме...")
+        
+        if not gemini_key and not openrouter_key:
+            raise AIProviderError(
+                "Не найден ни один API ключ для текстового режима. "
+                "Установите GEMINI_API_KEY или OPENROUTER_API_KEY."
+            )
+        
+        final_data = process_with_fallback(
+            markdown_content=text_content,
+            json_template=json_template_data,
+            prompt_creator_func=create_extraction_prompt,
+            gemini_api_key=gemini_key,
+            openrouter_api_key=openrouter_key,
+            gemini_model=model,
+            verbose=verbose,
+            user_hint=user_hint,
+        )
+    
+    # Сохранение результата
+    save_json(final_data, json_path)
+    
+    if verbose:
+        print(f"✅ Шаг 2 (direct) завершен: {json_path}")
         print(f"\n📊 Статистика извлеченных данных:")
         print(f"  - Опыт работы: {len(final_data.get('work_experience', []))} записей")
         print(f"  - Проекты: {len(final_data.get('project_experience', []))} записей")

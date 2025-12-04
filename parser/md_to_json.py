@@ -58,7 +58,7 @@ def load_json_template(template_path):
         sys.exit(1)
 
 
-def create_extraction_prompt(markdown_content, json_template):
+def create_extraction_prompt(markdown_content, json_template, user_hint=None):
     """
     Создает промпт для извлечения данных из MD в JSON структуру.
     
@@ -71,6 +71,10 @@ def create_extraction_prompt(markdown_content, json_template):
     """
     template_str = json.dumps(json_template, ensure_ascii=False, indent=2)
     
+    extra_hint = ""
+    if user_hint:
+        extra_hint = f"\n=== 6. ДОПОЛНИТЕЛЬНЫЕ ПОЖЕЛАНИЯ ОТ ПОЛЬЗОВАТЕЛЯ ===\n{user_hint.strip()}\n"
+
     prompt = f"""
 Ты — экспертный AI-ассистент, специализирующийся на парсинге резюме (CV) и извлечении структурированных данных. Твоя задача — заполнить JSON-структуру данными из текста резюме, следуя строгим правилам интерпретации понятий.
 
@@ -108,6 +112,11 @@ def create_extraction_prompt(markdown_content, json_template):
 - Краткая профессиональная выжимка (3-5 предложений).
 - Пиши от первого лица ("Разрабатывал...", "Имею опыт..."), но опуская местоимение "Я".
 - Используй факты, избегай общих фраз.
+
+**ПОЛЕ "experience_total":**
+- Рассчитай общий стаж по work_experience (от новейшего к старому), итог в формате: `X ЛЕТ Y МЕСЯЦЕВ` или `МЕНЕЕ 1 МЕСЯЦА`.
+- Учитывай, что период "Январь 2020 - Январь 2020" = 1 месяц (включительно).
+- Если нет данных — оставь пустой строкой.
 
 **ПОЛЕ "skills_and_tools" (Universal Smart Grouping):**
 - Содержание: Только HARD SKILLS (инструменты, программы, оборудование, стандарты, нормативные акты).
@@ -154,6 +163,8 @@ def create_extraction_prompt(markdown_content, json_template):
     - ВАЖНО: Ты должен сам вычислить длительность (X и Y) на основе дат. Считай внимательно.
 - **role:** Роль кандидата.
 - **achievements:** Список конкретных результатов (сделал X, улучшил Y на Z%).
+- **СОРТИРОВКА:** И work_experience, и project_experience отсортируй по дате (от самых свежих к более старым) перед возвратом JSON.
+- **ЖЁСТКИЙ ФИЛЬТР work_experience:** work_experience — только явные места работы (должность + компания + период). Строки вида "Проект:", "Клиент:", списки задач/технологий без периода, а также блоки без компании — НЕ work_experience; такие данные отправляй в project_experience или achievements внутри существующих записей.
 
 === 4. ВВОДНЫЕ ДАННЫЕ ===
 
@@ -165,8 +176,95 @@ def create_extraction_prompt(markdown_content, json_template):
 
 === 5. ВЫВОД ===
 Верни ТОЛЬКО валидный JSON. Никаких Markdown-тегов (```), никаких комментариев до или после JSON.
+{extra_hint}
 """
     
+    return prompt
+
+
+def create_extraction_prompt_for_file(json_template, user_hint=None):
+    """
+    Создает промпт для извлечения данных из файла (PDF/DOCX и т.п.) напрямую,
+    без инлайна текста резюме в промпт. Резюме передаётся в Gemini как файл.
+    
+    Args:
+        json_template (dict): JSON шаблон
+        
+    Returns:
+        str: Промпт для модели
+    """
+    template_str = json.dumps(json_template, ensure_ascii=False, indent=2)
+    
+    extra_hint = ""
+    if user_hint:
+        extra_hint = f"\n=== 5. ДОПОЛНИТЕЛЬНЫЕ ПОЖЕЛАНИЯ ОТ ПОЛЬЗОВАТЕЛЯ ===\n{user_hint.strip()}\n"
+
+    prompt = f"""
+Ты — экспертный AI-ассистент, специализирующийся на парсинге резюме (CV) и извлечении структурированных данных. 
+Твоя задача — заполнить JSON-структуру данными из резюме, которое передано ОТДЕЛЬНЫМ ФАЙЛОМ (PDF/DOCX и т.п.).
+
+=== 1. КРИТИЧЕСКИЕ ПРАВИЛА (ZERO-SHOT CONSTRAINTS) ===
+1. **Принцип Истины:** НЕ добавляй информацию, которой нет в тексте. НЕ придумывай названия проектов, компаний или цифры.
+2. **Принцип Пустоты:** Если данные отсутствуют — оставляй поле пустым ("" или []).
+3. **Принцип Точности:** Сохраняй оригинальные названия, даты и формулировки навыков.
+4. **Запрет внешних знаний:** Используй только содержимое прикреплённого резюме.
+
+=== 2. ОПРЕДЕЛЕНИЯ, АКЦЕНТЫ И ЖЁСТКИЕ ПРАВИЛА ПО ОПЫТУ (ОЧЕНЬ ВАЖНО) ===
+
+Все определения, разграничения (Project background, Soft skills, Education vs Advanced training, правила по skills_and_tools,
+форматам периодов, achievements и т.п.) идентичны тем, что описаны в текстовом промпте для Markdown-режима.
+Применяй те же самые правила, только источник данных — файл резюме.
+
+Дополнительные жёсткие правила ДЛЯ ПОЛЕЙ "work_experience" и "project_experience":
+
+1. **Единица учёта work_experience — место работы, а не каждый абзац.**
+   - Каждая запись work_experience должна соответствовать конкретной позиции в компании за период.
+   - НЕ создавай отдельную запись только на основании заголовков таблиц, блоков "Технологии", "Роли", "Конфигурации" и т.п.
+   - Если указан только проект/клиент без явного периода или без компании — это не work_experience; такие элементы относись к project_experience или achievements.
+
+2. **Условия включения записи в work_experience:**
+   - Обязательны ОДНОВРЕМЕННО:
+     - ЯВНЫЙ период в формате "МЕСЯЦ ГОД - МЕСЯЦ ГОД" или "МЕСЯЦ ГОД - настоящее время".
+     - Название компании (ООО/ЗАО/ГК/...).
+   - Если нет периода, но есть компания и описание задач → это не work_experience, а часть project_experience или achievements внутри уже существующей записи.
+
+3. **Разграничение work_experience vs project_experience:**
+   - work_experience — основные места работы (должность, компания, общий период работы).
+   - project_experience — отдельные проекты внутри этих компаний (могут быть несколько проектов на одну и ту же компанию и период).
+   - Не дублируй одинаковую компанию и период в work_experience только ради разных проектов — используй один элемент work_experience с несколькими achievements / проектами.
+
+4. **Уникальность и слияние дублей:**
+   - Внутри work_experience и project_experience НЕ должно быть дубликатов записей с одинаковыми:
+     - company И period (и при наличии — одинаковой role).
+   - Если ты находишь несколько фрагментов резюме, которые описывают один и тот же период в одной и той же компании:
+     - СОЕДИНИ их в одну запись:
+       - company и period берёшь один раз,
+       - achievements объединяешь в один список без повторов.
+
+5. **Особенности табличных резюме:**
+   - Игнорируй строки-заголовки вроде: "ОПЫТ", "Опыт работы", "Технологии и инструменты", "Роли в проектах", "Конфигурации", "Ключевые доработки" — они НЕ являются отдельными местами работы или проектами.
+   - Если в таблице одна и та же компания упоминается несколькими блоками (описание задач, ключевые доработки, технологии):
+     - трактуй это как ОДНУ компанию с несколькими группами задач/проектов, а не как много разных мест работы.
+
+6. **Сортировка:**
+   - work_experience и project_experience должны быть отсортированы по дате (от самых свежих к более старым).
+   - Если у нескольких записей период совпадает, сначала идут более важные/масштабные роли (по объёму ответственности).
+7. **Общий стаж (experience_total):**
+   - Посчитай суммарный стаж по всем элементам work_experience с включением стартового месяца.
+   - Итоговая строка в формате `X ЛЕТ Y МЕСЯЦЕВ` (или `МЕНЕЕ 1 МЕСЯЦА`, если 0).
+   - Добавь результат в поле `"experience_total"` в корне JSON.
+
+=== 3. ВВОДНЫЕ ДАННЫЕ ===
+
+Структура JSON (шаблон):
+{template_str}
+
+Резюме доступно тебе как отдельный файл (PDF/DOCX). Самостоятельно прочитай его содержимое и заполни структуру.
+
+=== 4. ВЫВОД ===
+Верни ТОЛЬКО валидный JSON. Никаких Markdown-тегов (```), никаких комментариев до или после JSON.
+{extra_hint}
+"""
     return prompt
 
 
@@ -203,7 +301,7 @@ def extract_json_from_response(response_text):
         raise
 
 
-def process_with_gemini(markdown_content, json_template, api_key, model_name=None):
+def process_with_gemini(markdown_content, json_template, api_key, model_name=None, user_hint=None):
     """
     Обрабатывает текст через AI API (Gemini или OpenRouter) для извлечения данных в JSON.
     Автоматически переключается на OpenRouter при ошибках Gemini (503, 500, 429).
@@ -222,7 +320,7 @@ def process_with_gemini(markdown_content, json_template, api_key, model_name=Non
     except ImportError:
         # Fallback на старую реализацию, если новый модуль недоступен
         print("⚠️  Модуль ai_provider не найден, используется старая реализация Gemini")
-        return _process_with_gemini_legacy(markdown_content, json_template, api_key, model_name)
+        return _process_with_gemini_legacy(markdown_content, json_template, api_key, model_name, user_hint=user_hint)
     
     # Получаем API ключи
     env_keys = get_api_keys()
@@ -238,17 +336,18 @@ def process_with_gemini(markdown_content, json_template, api_key, model_name=Non
             gemini_api_key=gemini_key,
             openrouter_api_key=openrouter_key,
             gemini_model=model_name,
-            verbose=True
+            verbose=True,
+            user_hint=user_hint,
         )
     except Exception as e:
         # Если новый провайдер не работает, пробуем старую реализацию
         if gemini_key:
             print(f"⚠️  Ошибка нового провайдера, пробуем старую реализацию: {e}")
-            return _process_with_gemini_legacy(markdown_content, json_template, gemini_key, model_name)
+            return _process_with_gemini_legacy(markdown_content, json_template, gemini_key, model_name, user_hint=user_hint)
         raise
 
 
-def _process_with_gemini_legacy(markdown_content, json_template, api_key, model_name=None):
+def _process_with_gemini_legacy(markdown_content, json_template, api_key, model_name=None, user_hint=None):
     """
     Старая реализация обработки через Gemini API (для обратной совместимости).
     
@@ -263,7 +362,7 @@ def _process_with_gemini_legacy(markdown_content, json_template, api_key, model_
     """
     model_name = model_name or DEFAULT_GEMINI_MODEL
     
-    prompt = create_extraction_prompt(markdown_content, json_template)
+    prompt = create_extraction_prompt(markdown_content, json_template, user_hint=user_hint)
     
     print("Отправка запроса в Gemini API...")
     print(f"Используемая модель: {model_name}")

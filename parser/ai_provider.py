@@ -82,6 +82,66 @@ class GeminiProvider:
                 raise AIProviderError(f"Ошибка конфигурации Gemini API: {e}")
         return self.client
     
+    def generate_with_file(self, file_path: str, prompt: str) -> str:
+        """
+        Генерирует ответ через Gemini API, передавая исходный файл напрямую.
+        
+        Args:
+            file_path: Путь к файлу (PDF/DOCX/другой поддерживаемый формат)
+            prompt: Текстовая инструкция для модели
+        """
+        client = self._get_client()
+        
+        try:
+            uploaded_file = client.files.upload(file=file_path)
+        except Exception as upload_error:
+            raise AIProviderError(f"Ошибка загрузки файла в Gemini: {upload_error}")
+        
+        try:
+            response = client.models.generate_content(
+                model=self.model,
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "file_data": {
+                                    "file_uri": uploaded_file.uri
+                                }
+                            },
+                            {
+                                "text": prompt
+                            },
+                        ],
+                    }
+                ],
+            )
+        except Exception as api_error:
+            error_str = str(api_error).lower()
+            if any(code in error_str for code in ['503', '500', '429', 'service unavailable', 'unavailable']):
+                raise AIProviderError(f"Gemini API недоступен (503/500/429) при работе с файлом: {api_error}")
+            raise AIProviderError(f"Ошибка при обращении к Gemini API (file-mode): {api_error}")
+        
+        # Извлечение текста из ответа
+        response_text = getattr(response, "text", None)
+        if not response_text:
+            try:
+                candidates = getattr(response, "candidates", [])
+                for candidate in candidates:
+                    for part in candidate.content.parts:
+                        if getattr(part, "text", None):
+                            response_text = part.text
+                            break
+                    if response_text:
+                        break
+            except Exception:
+                response_text = None
+        
+        if not response_text:
+            raise AIProviderError("Пустой ответ от Gemini API (file-mode)")
+        
+        return response_text
+    
     def generate(self, prompt: str) -> str:
         """
         Генерирует ответ через Gemini API.
@@ -324,6 +384,62 @@ def get_last_used_provider() -> Dict[str, Any]:
     return _last_used_provider_info.copy()
 
 
+def process_file_with_gemini(
+    file_path: str,
+    json_template: Dict[str, Any],
+    prompt_creator_func,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: Optional[str] = None,
+    verbose: bool = True,
+    user_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Обрабатывает файл напрямую через Gemini API, без промежуточного Markdown.
+    
+    Args:
+        file_path: Путь к исходному файлу (PDF/DOCX/др.)
+        json_template: JSON шаблон
+        prompt_creator_func: Функция для создания промпта (принимает json_template)
+        gemini_api_key: API ключ Gemini (опционально, берётся из окружения)
+        gemini_model: Имя модели Gemini (по умолчанию: DEFAULT_GEMINI_MODEL)
+        verbose: Выводить ли логи
+    """
+    # Локальный импорт, чтобы избежать жёсткой циклической зависимости
+    from parser.md_to_json import extract_json_from_response  # type: ignore
+    
+    keys = get_api_keys()
+    gemini_key = gemini_api_key or keys.get("gemini")
+    
+    if not gemini_key:
+        raise AIProviderError(
+            "Не найден GEMINI_API_KEY для прямой обработки файла. "
+            "Установите ключ в окружении или .env."
+        )
+    
+    gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
+    try:
+        prompt = prompt_creator_func(json_template, user_hint=user_hint)
+    except TypeError:
+        prompt = prompt_creator_func(json_template)
+    
+    if verbose:
+        print("🔄 Обработка файла напрямую через Gemini API...")
+        print(f"   Модель: {gemini_model}")
+        print(f"   Файл: {file_path}")
+    
+    provider = GeminiProvider(gemini_key, gemini_model)
+    response_text = provider.generate_with_file(file_path, prompt)
+    
+    global _last_used_provider_info
+    _last_used_provider_info = {
+        "provider": "gemini",
+        "model": gemini_model,
+        "timestamp": time.time(),
+    }
+    
+    return extract_json_from_response(response_text)
+
+
 def process_with_fallback(
     markdown_content: str,
     json_template: Dict[str, Any],
@@ -333,7 +449,8 @@ def process_with_fallback(
     gemini_model: Optional[str] = None,
     openrouter_model: Optional[str] = None,
     verbose: bool = True,
-    return_provider_info: bool = False
+    return_provider_info: bool = False,
+    user_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Обрабатывает текст через AI с автоматическим fallback между провайдерами.
@@ -370,7 +487,10 @@ def process_with_fallback(
         )
     
     # Создаем промпт
-    prompt = prompt_creator_func(markdown_content, json_template)
+    try:
+        prompt = prompt_creator_func(markdown_content, json_template, user_hint=user_hint)
+    except TypeError:
+        prompt = prompt_creator_func(markdown_content, json_template)
     
     gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
     openrouter_model = openrouter_model or get_openrouter_model()
@@ -487,4 +607,3 @@ def process_with_fallback(
     
     # Если дошли сюда, значит нет доступных провайдеров
     raise AIProviderError("Нет доступных AI провайдеров для обработки запроса")
-
